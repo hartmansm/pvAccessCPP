@@ -1,8 +1,13 @@
+/*
+ * Copyright information and license terms for this software can be
+ * found in the file LICENSE that is included with the distribution
+ */
 
 #include <stdio.h>
 
 #include <iostream>
 #include <map>
+#include <iterator>
 #include <vector>
 #include <string>
 #include <istream>
@@ -25,7 +30,7 @@
 #include <pv/remote.h>
 #include <pv/rpcClient.h>
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(_MINGW)
 FILE *popen(const char *command, const char *mode) {
     return _popen(command, mode);
 }
@@ -35,15 +40,17 @@ int pclose(FILE *stream) {
 #endif
 
 using namespace std;
-using namespace std::tr1;
 
 using namespace epics::pvData;
 using namespace epics::pvAccess;
 
+namespace {
+
 /// Byte to hexchar mapping.
 static const char lookup[] = {
-        '0', '1', '2', '3', '4', '5', '6', '7',
-        '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
+    '0', '1', '2', '3', '4', '5', '6', '7',
+    '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'
+};
 
 /// Get hex representation of byte.
 string toHex(int8* ba, size_t len) {
@@ -63,8 +70,6 @@ string toHex(int8* ba, size_t len) {
     return sb;
 }
 
-
-static string emptyString;
 
 std::size_t readSize(ByteBuffer* buffer) {
     int8 b = buffer->getByte();
@@ -91,7 +96,7 @@ string deserializeString(ByteBuffer* buffer) {
         return str;
     }
     else
-        return emptyString;
+        return std::string();
 }
 
 struct ServerEntry {
@@ -138,12 +143,13 @@ bool processSearchResponse(osiSockAddr const & responseFrom, ByteBuffer & receiv
         return false;
 
 
-    epics::pvAccess::GUID guid;
+    epics::pvAccess::ServerGUID guid;
     receiveBuffer.get(guid.value, 0, sizeof(guid.value));
 
     /*int32 searchSequenceId = */receiveBuffer.getInt();
 
     osiSockAddr serverAddress;
+    memset(&serverAddress, 0, sizeof(serverAddress));
     serverAddress.ia.sin_family = AF_INET;
 
     // 128-bit IPv6 address
@@ -225,7 +231,23 @@ bool discoverServers(double timeOut)
     int broadcastPort = configuration->getPropertyAsInteger("EPICS_PVA_BROADCAST_PORT", PVA_BROADCAST_PORT);
 
     // quary broadcast addresses of all IFs
-    auto_ptr<InetAddrVector> broadcastAddresses(getBroadcastAddresses(socket, broadcastPort));
+    InetAddrVector broadcastAddresses;
+    {
+        IfaceNodeVector ifaces;
+        if(discoverInterfaces(ifaces, socket, 0)) {
+            fprintf(stderr, "Unable to populate interface list\n");
+            return false;
+        }
+
+        for(IfaceNodeVector::const_iterator it(ifaces.begin()), end(ifaces.end()); it!=end; ++it)
+        {
+            if(it->validBcast && it->bcast.sa.sa_family == AF_INET) {
+                osiSockAddr bcast = it->bcast;
+                bcast.ia.sin_port = htons(broadcastPort);
+                broadcastAddresses.push_back(bcast);
+            }
+        }
+    }
 
     // set broadcast address list
     if (!addressList.empty())
@@ -233,18 +255,19 @@ bool discoverServers(double timeOut)
         // if auto is true, add it to specified list
         InetAddrVector* appendList = 0;
         if (autoAddressList)
-            appendList = broadcastAddresses.get();
+            appendList = &broadcastAddresses;
 
-        auto_ptr<InetAddrVector> list(getSocketAddressList(addressList, broadcastPort, appendList));
-        if (list.get() && list->size()) {
+        InetAddrVector list;
+        getSocketAddressList(list, addressList, broadcastPort, appendList);
+        if (!list.empty()) {
             // delete old list and take ownership of a new one
             broadcastAddresses = list;
         }
     }
 
-    for (size_t i = 0; broadcastAddresses.get() && i < broadcastAddresses->size(); i++)
+    for (size_t i = 0; i < broadcastAddresses.size(); i++)
         LOG(logLevelDebug,
-            "Broadcast address #%d: %s.", i, inetAddressToString((*broadcastAddresses)[i]).c_str());
+            "Broadcast address #%zu: %s.", i, inetAddressToString(broadcastAddresses[i]).c_str());
 
     // ---
 
@@ -260,6 +283,7 @@ bool discoverServers(double timeOut)
     }
 
     osiSockAddr bindAddr;
+    memset(&bindAddr, 0, sizeof(bindAddr));
     bindAddr.ia.sin_family = AF_INET;
     bindAddr.ia.sin_port = htons(0);
     bindAddr.ia.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -311,7 +335,7 @@ bool discoverServers(double timeOut)
     sendBuffer.putByte(PVA_MAGIC);
     sendBuffer.putByte(PVA_VERSION);
     sendBuffer.putByte((EPICS_BYTE_ORDER == EPICS_ENDIAN_BIG) ? 0x80 : 0x00); // data + 7-bit endianess
-    sendBuffer.putByte((int8_t)3);	// search
+    sendBuffer.putByte((int8_t)CMD_SEARCH);	// search
     sendBuffer.putInt(4+1+3+16+2+1+2);		// "zero" payload
 
     sendBuffer.putInt(0);   // sequenceId
@@ -323,15 +347,20 @@ bool discoverServers(double timeOut)
     encodeAsIPv6Address(&sendBuffer, &responseAddress);
     sendBuffer.putShort((int16_t)ntohs(responseAddress.ia.sin_port));
 
-    sendBuffer.putByte((int8_t)0x00);	// no restriction on protocol
-    sendBuffer.putShort((int16_t)0);	// count
+    sendBuffer.putByte((int8_t)0x00);	// protocol count
+    sendBuffer.putShort((int16_t)0);	// name count
 
     bool oneOK = false;
-    for (size_t i = 0; i < broadcastAddresses->size(); i++)
+    for (size_t i = 0; i < broadcastAddresses.size(); i++)
     {
-        // send the packet
+        if(pvAccessIsLoggable(logLevelDebug)) {
+            char strBuffer[64];
+            sockAddrToDottedIP(&broadcastAddresses[i].sa, strBuffer, sizeof(strBuffer));
+            LOG(logLevelDebug, "UDP Tx (%zu) -> %s", sendBuffer.getPosition(), strBuffer);
+        }
+
         status = ::sendto(socket, sendBuffer.getArray(), sendBuffer.getPosition(), 0,
-                          &((*broadcastAddresses)[i].sa), sizeof(sockaddr));
+                          &broadcastAddresses[i].sa, sizeof(sockaddr));
         if (status < 0)
         {
             char errStr[64];
@@ -360,11 +389,16 @@ bool discoverServers(double timeOut)
 
         // receive packet from socket
         int bytesRead = ::recvfrom(socket, (char*)receiveBuffer.getArray(),
-                            receiveBuffer.getRemaining(), 0,
-                            (sockaddr*)&fromAddress, &addrStructSize);
+                                   receiveBuffer.getRemaining(), 0,
+                                   (sockaddr*)&fromAddress, &addrStructSize);
 
         if (bytesRead > 0)
         {
+            if(pvAccessIsLoggable(logLevelDebug)) {
+                char strBuffer[64];
+                sockAddrToDottedIP(&fromAddress.sa, strBuffer, sizeof(strBuffer));
+                LOG(logLevelDebug, "UDP Rx (%d) <- %s", bytesRead, strBuffer);
+            }
             receiveBuffer.setPosition(bytesRead);
             receiveBuffer.flip();
 
@@ -379,15 +413,15 @@ bool discoverServers(double timeOut)
 
                 // interrupted or timeout
                 if (socketError == SOCK_EINTR ||
-                    socketError == EAGAIN ||        // no alias in libCom
-                    // windows times out with this
-                    socketError == SOCK_ETIMEDOUT ||
-                    socketError == SOCK_EWOULDBLOCK)
+                        socketError == EAGAIN ||        // no alias in libCom
+                        // windows times out with this
+                        socketError == SOCK_ETIMEDOUT ||
+                        socketError == SOCK_EWOULDBLOCK)
                 {
                     // OK
                 }
                 else if (socketError == SOCK_ECONNREFUSED || // avoid spurious ECONNREFUSED in Linux
-                    socketError == SOCK_ECONNRESET)     // or ECONNRESET in Windows
+                         socketError == SOCK_ECONNRESET)     // or ECONNRESET in Windows
                 {
                     // OK
                 }
@@ -406,11 +440,11 @@ bool discoverServers(double timeOut)
             {
                 // TODO duplicate code
                 bool oneOK = false;
-                for (size_t i = 0; i < broadcastAddresses->size(); i++)
+                for (size_t i = 0; i < broadcastAddresses.size(); i++)
                 {
                     // send the packet
                     status = ::sendto(socket, sendBuffer.getArray(), sendBuffer.getPosition(), 0,
-                                      &((*broadcastAddresses)[i].sa), sizeof(sockaddr));
+                                      &broadcastAddresses[i].sa, sizeof(sockaddr));
                     if (status < 0)
                     {
                         char errStr[64];
@@ -444,15 +478,16 @@ bool discoverServers(double timeOut)
 void usage (void)
 {
     fprintf (stderr, "\nUsage: pvlist [options] [<server address or GUID starting with '0x'>]...\n\n"
-    "  -h: Help: Print this message\n"
-    "options:\n"
-    "  -i                 Print server info (when server address list/GUID is given)\n"
-    "  -w <sec>:          Wait time, specifies timeout, default is %f second(s)\n"
-    "  -q:                Quiet mode, print only error messages\n"
-    "  -d:                Enable debug output\n"
+             "\noptions:\n"
+             "  -h: Help: Print this message\n"
+             "  -V: Print version and exit\n"
+             "  -i                 Print server info (when server address list/GUID is given)\n"
+             "  -w <sec>:          Wait time, specifies timeout, default is %f second(s)\n"
+             "  -q:                Quiet mode, print only error messages\n"
+             "  -d:                Enable debug output\n"
 //    "  -F <ofs>:          Use <ofs> as an alternate output field separator\n"
 //    "  -f <input file>:   Use <input file> as an input that provides a list input parameters(s) to be read, use '-' for stdin\n"
-    "\nexamples:\n"
+             "\nexamples:\n"
              "\tpvlist\n"
              "\tpvlist ioc0001\n"
              "\tpvlist 10.5.1.205:10000\n"
@@ -460,6 +495,7 @@ void usage (void)
              , DEFAULT_TIMEOUT);
 }
 
+}//namespace
 
 /*+**************************************************************************
  *
@@ -480,9 +516,7 @@ int main (int argc, char *argv[])
 {
     int opt;                    /* getopt() current option */
     bool debug = false;
-    bool quiet = false;
     double timeOut = DEFAULT_TIMEOUT;
-   // char fieldSeparator = ' ';
     bool printInfo = false;
 
     /*
@@ -492,11 +526,21 @@ int main (int argc, char *argv[])
     */
     setvbuf(stdout,NULL,_IOLBF,BUFSIZ);    /* Set stdout to line buffering */
 
-    while ((opt = getopt(argc, argv, ":hw:qdF:f:i")) != -1) {
+    while ((opt = getopt(argc, argv, ":hVw:qdF:f:i")) != -1) {
         switch (opt) {
         case 'h':               /* Print usage */
             usage();
             return 0;
+        case 'V':               /* Print version */
+        {
+            Version version("pvlist", "cpp",
+                    EPICS_PVA_MAJOR_VERSION,
+                    EPICS_PVA_MINOR_VERSION,
+                    EPICS_PVA_MAINTENANCE_VERSION,
+                    EPICS_PVA_DEVELOPMENT_FLAG);
+            fprintf(stdout, "%s\n", version.getVersionString().c_str());
+            return 0;
+        }
         case 'w':               /* Set PVA timeout value */
             if((epicsScanDouble(optarg, &timeOut)) != 1 || timeOut <= 0.0)
             {
@@ -506,7 +550,6 @@ int main (int argc, char *argv[])
             }
             break;
         case 'q':               /* Quiet mode */
-            quiet = true;
             break;
         case 'd':               /* Debug log level */
             debug = true;
@@ -514,32 +557,6 @@ int main (int argc, char *argv[])
         case 'i':               /* Print server info */
             printInfo = true;
             break;
-            /*
-        case 'F':               // Store this for output formatting
-            fieldSeparator = (char) *optarg;
-            break;
-        case 'f':               // Use input stream as input
-        {
-            string fileName = optarg;
-            if (fileName == "-")
-                inputStream = &cin;
-            else
-            {
-                ifs.open(fileName.c_str(), ifstream::in);
-                if (!ifs)
-                {
-                    fprintf(stderr,
-                            "Failed to open file '%s'.\n",
-                            fileName.c_str());
-                    return 1;
-                }
-                else
-                    inputStream = &ifs;
-            }
-
-            fromStream = true;
-            break;
-        }*/
         case '?':
             fprintf(stderr,
                     "Unrecognized option: '-%c'. ('pvlist -h' for help.)\n",
@@ -567,8 +584,8 @@ int main (int argc, char *argv[])
 
         // by GUID search
         if (serverAddress.length() == 26 &&
-            serverAddress[0] == '0' &&
-            serverAddress[1] == 'x')
+                serverAddress[0] == '0' &&
+                serverAddress[1] == 'x')
         {
             byGUIDSearch = true;
             break;
@@ -577,25 +594,19 @@ int main (int argc, char *argv[])
 
     bool allOK = true;
 
-    //if (!quiet)
-    //    fprintf(stderr, "Searching...\n");
-
     if (noArgs || byGUIDSearch)
         discoverServers(timeOut);
-
-    //if (!quiet)
-    //    fprintf(stderr, "done.\n");
 
     // just list all the discovered servers
     if (noArgs)
     {
         for (ServerMap::const_iterator iter = serverMap.begin();
-             iter != serverMap.end();
-             iter++)
+                iter != serverMap.end();
+                iter++)
         {
             const ServerEntry& entry = iter->second;
 
-            cout << "GUID 0x" << entry.guid << ", version " << (int)entry.version << ": "
+            cout << "GUID 0x" << entry.guid << " version " << (int)entry.version << ": "
                  << entry.protocol << "@[";
 
             size_t count = entry.addresses.size();
@@ -616,13 +627,13 @@ int main (int argc, char *argv[])
 
             // by GUID search
             if (serverAddress.length() == 26 &&
-                serverAddress[0] == '0' &&
-                serverAddress[1] == 'x')
+                    serverAddress[0] == '0' &&
+                    serverAddress[1] == 'x')
             {
                 bool resolved = false;
                 for (ServerMap::const_iterator iter = serverMap.begin();
-                     iter != serverMap.end();
-                     iter++)
+                        iter != serverMap.end();
+                        iter++)
                 {
                     const ServerEntry& entry = iter->second;
 
@@ -645,32 +656,53 @@ int main (int argc, char *argv[])
                 }
             }
 
-            // TODO for now we call eget utility
-            // TODO timeOut
-            string cmd = "eget -";
-            if (debug)
-                cmd += 'd';
-            if (quiet)
-                cmd += 'q';
-            if (printInfo)
-                cmd += 'N';
-            cmd += "s pva://" + serverAddress + "/server?op=";
-            if (printInfo)
-                cmd += "info";
-            else
-                cmd += "channels";
+            StructureConstPtr argstype(getFieldCreate()->createFieldBuilder()
+                                       ->setId("epics:nt/NTURI:1.0")
+                                       ->add("scheme", pvString)
+                                       ->add("path", pvString)
+                                       ->addNestedStructure("query")
+                                           ->add("op", pvString)
+                                       ->endNested()
+                                       ->createStructure());
 
-            FILE* egetpipe = popen (cmd.c_str(), "w");
-            if (!egetpipe)
-            {
-                char errStr[64];
-                epicsSocketConvertErrnoToString(errStr, sizeof(errStr));
-                fprintf(stderr, "Failed to exec 'eget': %s\n", errStr);
-                allOK = false;
+            PVStructure::shared_pointer args(getPVDataCreate()->createPVStructure(argstype));
+
+            args->getSubFieldT<PVString>("scheme")->put("pva");
+            args->getSubFieldT<PVString>("path")->put("server");
+            args->getSubFieldT<PVString>("query.op")->put(printInfo ? "info" : "channels");
+
+            if(debug) {
+                std::cerr<<"Query to "<<serverAddress<<"\n"<<args<<"\n";
             }
 
-            pclose(egetpipe);
+            PVStructure::shared_pointer ret;
+            try {
+                RPCClient rpc("server",
+                              createRequest("field()"),
+                              ChannelProvider::shared_pointer(),
+                              serverAddress);
 
+                if(debug)
+                    std::cerr<<"Execute\n";
+                ret = rpc.request(args, timeOut, true);
+            } catch(std::exception& e) {
+                std::cerr<<"Error: "<<e.what()<<"\n";
+                return 1;
+            }
+
+            if(!printInfo) {
+                PVStringArray::shared_pointer pvs(ret->getSubField<PVStringArray>("value"));
+
+                PVStringArray::const_svector val(pvs->view());
+
+                std::copy(val.begin(),
+                          val.end(),
+                          std::ostream_iterator<std::string>(std::cout, "\n"));
+
+                return allOK ? 0 : 1;
+            }
+
+            std::cout<<ret<<"\n";
         }
     }
 

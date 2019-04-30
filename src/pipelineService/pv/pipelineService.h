@@ -26,7 +26,8 @@
 
 #include <shareLib.h>
 
-namespace epics { namespace pvAccess { 
+namespace epics {
+namespace pvAccess {
 
 class epicsShareClass PipelineControl
 {
@@ -46,10 +47,10 @@ public:
     /// Grab next free element.
     /// A service should take this element, populate it with the data
     /// and return it back by calling putElement().
-    virtual epics::pvData::MonitorElement::shared_pointer getFreeElement() = 0;
+    virtual MonitorElement::shared_pointer getFreeElement() = 0;
 
     /// Put element on the local queue (an element to be sent to a client).
-    virtual void putElement(epics::pvData::MonitorElement::shared_pointer const & element) = 0;
+    virtual void putElement(MonitorElement::shared_pointer const & element) = 0;
 
     /// Call to notify that there is no more data to pipelined.
     /// This call destroyes corresponding pipeline session.
@@ -86,16 +87,17 @@ class epicsShareClass PipelineService
 {
 public:
     POINTER_DEFINITIONS(PipelineService);
-   
+
     virtual ~PipelineService() {};
 
     virtual PipelineSession::shared_pointer createPipeline(
-            epics::pvData::PVStructure::shared_pointer const & pvRequest
-            ) = 0;
+        epics::pvData::PVStructure::shared_pointer const & pvRequest
+    ) = 0;
 
 };
 
 
-}}
+}
+}
 
 #endif  /* PIPELINESERVICE_H */

@@ -1,6 +1,9 @@
+/*
+ * Copyright information and license terms for this software can be
+ * found in the file LICENSE that is included with the distribution
+ */
 #include <iostream>
-#include <pv/clientFactory.h>
-#include <pv/pvAccess.h>
+#include <pva/client.h>
 #include <pv/caProvider.h>
 
 #include <stdio.h>
@@ -17,71 +20,119 @@
 #include <pv/event.h>
 #include <epicsExit.h>
 
-#include "pvutils.cpp"
+#include "pvutils.h"
 
-using namespace std;
-using namespace std::tr1;
-using namespace epics::pvData;
-using namespace epics::pvAccess;
+namespace pvd = epics::pvData;
+namespace pva = epics::pvAccess;
 
-
-#define DEFAULT_TIMEOUT 3.0
-#define DEFAULT_PROVIDER "pva"
-
-double timeOut = DEFAULT_TIMEOUT;
-string defaultProvider(DEFAULT_PROVIDER);
-const string noAddress;
+namespace {
 
 void usage (void)
 {
     fprintf (stderr, "\nUsage: pvinfo [options] <PV name>...\n\n"
-    "  -h: Help: Print this message\n"
-    "options:\n"
-    "  -w <sec>:          Wait time, specifies timeout, default is %f second(s)\n"
-    "  -p <provider>:     Set default provider name, default is '%s'\n"
-    "  -d:                Enable debug output\n"
-    "  -c:                Wait for clean shutdown and report used instance count (for expert users)"
-    "\nExample: pvinfo double01\n\n"
-             , DEFAULT_TIMEOUT, DEFAULT_PROVIDER);
+             "\noptions:\n"
+             "  -h: Help: Print this message\n"
+             "  -V: Print version and exit\n"
+             "  -w <sec>:          Wait time, specifies timeout, default is %f second(s)\n"
+             "  -p <provider>:     Set default provider name, default is '%s'\n"
+             "  -d:                Enable debug output\n"
+             "  -c:                Wait for clean shutdown and report used instance count (for expert users)"
+             "\nExample: pvinfo double01\n\n"
+             , timeout, defaultProvider.c_str());
 }
 
+int haderror;
 
-/*+**************************************************************************
- *
- * Function:	main
- *
- * Description:	pvinfo main()
- * 		Evaluate command line options, set up PVA, connect the
- * 		channels, print the data as requested
- *
- * Arg(s) In:	[options] <pv-name>...
- *
- * Arg(s) Out:	none
- *
- * Return(s):	Standard return code (0=success, 1=error)
- *
- **************************************************************************-*/
+struct GetInfo : public pvac::ClientChannel::InfoCallback,
+                 public pvac::ClientChannel::ConnectCallback,
+                 public Tracker
+{
+    pvac::ClientChannel chan;
+    pvac::Operation op;
+
+    std::string peerName;
+
+    explicit GetInfo(pvac::ClientChannel& chan)
+        :chan(chan)
+    {
+        chan.addConnectListener(this);
+    }
+    virtual ~GetInfo()
+    {
+        chan.removeConnectListener(this);
+    }
+
+    virtual void connectEvent(const pvac::ConnectEvent& evt) OVERRIDE FINAL
+    {
+        if(evt.connected) {
+            Guard G(doneLock);
+            peerName = evt.peerName;
+        }
+    }
+
+    virtual void infoDone(const pvac::InfoEvent& evt) OVERRIDE FINAL
+    {
+        std::string pname;
+        {
+            Guard G(doneLock);
+            pname = peerName;
+        }
+
+        switch(evt.event) {
+        case pvac::InfoEvent::Cancel: break;
+        case pvac::InfoEvent::Fail:
+            std::cerr<<op.name()<<" Error: "<<evt.message<<"\n";
+            haderror = 1;
+            break;
+        case pvac::InfoEvent::Success: {
+            std::cout<<op.name()<<"\n"
+                     "Server: "<<pname<<"\n"
+                     "Type:\n";
+            pvd::format::indent_scope I(std::cout);
+            std::cout<<evt.type<<"\n";
+        }
+        }
+        done();
+        std::cout.flush();
+    }
+};
+
+} // namespace
+
 
 int main (int argc, char *argv[])
 {
     int opt;                    /* getopt() current option */
     bool debug = false;
-    bool cleanupAndReport = false;
 
     setvbuf(stdout,NULL,_IOLBF,BUFSIZ);    /* Set stdout to line buffering */
 
-    while ((opt = getopt(argc, argv, ":hw:p:dc")) != -1) {
+    while ((opt = getopt(argc, argv, ":hVw:p:dc")) != -1) {
         switch (opt) {
         case 'h':               /* Print usage */
             usage();
             return 0;
+        case 'V':               /* Print version */
+        {
+            pva::Version version("pvinfo", "cpp",
+                    EPICS_PVA_MAJOR_VERSION,
+                    EPICS_PVA_MINOR_VERSION,
+                    EPICS_PVA_MAINTENANCE_VERSION,
+                    EPICS_PVA_DEVELOPMENT_FLAG);
+            fprintf(stdout, "%s\n", version.getVersionString().c_str());
+            return 0;
+        }
         case 'w':               /* Set PVA timeout value */
-            if((epicsScanDouble(optarg, &timeOut)) != 1 || timeOut <= 0.0)
+        {
+            double temp;
+            if((epicsScanDouble(optarg, &temp)) != 1 || timeout <= 0.0)
             {
                 fprintf(stderr, "'%s' is not a valid timeout value "
                         "- ignored. ('pvget -h' for help.)\n", optarg);
-                timeOut = DEFAULT_TIMEOUT;
+            } else {
+                timeout = temp;
             }
+        }
             break;
         case 'p':               /* Set default provider */
             defaultProvider = optarg;
@@ -90,7 +141,6 @@ int main (int argc, char *argv[])
             debug = true;
             break;
         case 'c':               /* Clean-up and report used instance count */
-            cleanupAndReport = true;
             break;
         case '?':
             fprintf(stderr,
@@ -108,139 +158,44 @@ int main (int argc, char *argv[])
         }
     }
 
-    int nPvs = argc - optind;       /* Remaining arg list are PV names */
-    if (nPvs < 1)
+    if (argc == optind)
     {
         fprintf(stderr, "No pv name(s) specified. ('pvinfo -h' for help.)\n");
         return 1;
     }
 
-    vector<string> pvs;     /* Array of PV names */
-    for (int n = 0; optind < argc; n++, optind++)
-        pvs.push_back(argv[optind]);       /* Copy PV names from command line */
+    SET_LOG_LEVEL(debug ? pva::logLevelDebug : pva::logLevelError);
 
+    std::vector<std::tr1::shared_ptr<GetInfo> > infos;
 
-    SET_LOG_LEVEL(debug ? logLevelDebug : logLevelError);
+    pva::ca::CAClientFactory::start();
 
-    std::cout << std::boolalpha;
-
-    bool allOK = true;
-
-    {
-        std::vector<std::string> pvNames;
-        std::vector<std::string> pvAddresses;
-        std::vector<std::string> providerNames;
-
-        pvNames.reserve(nPvs);
-        pvAddresses.reserve(nPvs);
-        providerNames.reserve(nPvs);
-
-        for (int n = 0; n < nPvs; n++)
         {
-            URI uri;
-            bool validURI = URI::parse(pvs[n], uri);
+        pvac::ClientProvider prov(defaultProvider);
 
-            shared_ptr<ChannelRequesterImpl> channelRequesterImpl(new ChannelRequesterImpl());
+        for(int i = optind; i<argc; i++) {
+            pvac::ClientChannel chan(prov.connect(argv[i]));
+            std::tr1::shared_ptr<GetInfo> info(new GetInfo(chan));
+            info->op = chan.info(info.get());
+            infos.push_back(info);
+        }
 
-            std::string providerName(defaultProvider);
-            std::string pvName(pvs[n]);
-            std::string address(noAddress);
-            bool usingDefaultProvider = true;
-            if (validURI)
-            {
-                if (uri.path.length() <= 1)
-                {
-                    std::cerr << "invalid URI '" << pvs[n] << "', empty path" << std::endl;
-                    return 1;
+        Tracker::prepare(); // install signal handler
+
+        {
+            Guard G(Tracker::doneLock);
+            while(Tracker::inprog.size() && !Tracker::abort) {
+                UnGuard U(G);
+                if(timeout<=0)
+                    Tracker::doneEvt.wait();
+                else if(!Tracker::doneEvt.wait(timeout)) {
+                    haderror = 1;
+                    std::cerr<<"Timeout\n";
+                    break;
                 }
-                providerName = uri.protocol;
-                pvName = uri.path.substr(1);
-                address = uri.host;
-                usingDefaultProvider = false;
             }
-
-            if ((providerName != "pva") && (providerName != "ca"))
-            {
-                std::cerr << "invalid "
-                          << (usingDefaultProvider ? "default provider" : "URI scheme")
-                          << " '" << providerName 
-                          << "', only 'pva' and 'ca' are supported" << std::endl;
-                return 1;
-            }
-            pvNames.push_back(pvName);
-            pvAddresses.push_back(address);
-            providerNames.push_back(providerName);
         }
-
-        ClientFactory::start();
-        epics::pvAccess::ca::CAClientFactory::start();
-
-        // first connect to all, this allows resource (e.g. TCP connection) sharing
-        vector<Channel::shared_pointer> channels(nPvs);
-        for (int n = 0; n < nPvs; n++)
-        {
-            shared_ptr<ChannelRequesterImpl> channelRequesterImpl(new ChannelRequesterImpl());
-            if (pvAddresses[n].empty())
-                channels[n] = getChannelProviderRegistry()->getProvider(
-                    providerNames[n])->createChannel(pvNames[n], channelRequesterImpl);
-            else
-                channels[n] = getChannelProviderRegistry()->getProvider(
-                    providerNames[n])->createChannel(pvNames[n], channelRequesterImpl,
-                    ChannelProvider::PRIORITY_DEFAULT, pvAddresses[n]);
-        }
-        
-        // for now a simple iterating sync implementation, guarantees order
-        for (int n = 0; n < nPvs; n++)
-        {
-            Channel::shared_pointer channel = channels[n];
-            shared_ptr<ChannelRequesterImpl> channelRequesterImpl = dynamic_pointer_cast<ChannelRequesterImpl>(channel->getChannelRequester());
-             
-            if (channelRequesterImpl->waitUntilConnected(timeOut))
-            {
-                shared_ptr<GetFieldRequesterImpl> getFieldRequesterImpl(new GetFieldRequesterImpl(channel));
-                channel->getField(getFieldRequesterImpl, "");
-
-                if (getFieldRequesterImpl->waitUntilFieldGet(timeOut))
-            	{
-                    Structure::const_shared_pointer structure =
-                            dynamic_pointer_cast<const Structure>(getFieldRequesterImpl->getField());
-
-                    channel->printInfo();
-                    if (structure)
-                    {
-                        std::cout << *structure << std::endl << std::endl;
-                    }
-                    else
-                    {
-                        std::cout << "(null introspection data)" << std::endl << std::endl;
-                    }
-            	}
-            	else
-            	{
-            		allOK = false;
-                    channel->destroy();
-                    std::cerr << "[" << channel->getChannelName() << "] failed to get channel introspection data" << std::endl;
-            	}
-            }
-            else
-            {
-                allOK = false;
-                channel->destroy();
-                std::cerr << "[" << channel->getChannelName() << "] connection timeout" << std::endl;
-            }
-        }    
-
-        epics::pvAccess::ca::CAClientFactory::stop();
-        ClientFactory::stop();
     }
 
-    if (cleanupAndReport)
-    {
-        // TODO implement wait on context
-        epicsThreadSleep ( 3.0 );
-        //std::cout << "-----------------------------------------------------------------------" << std::endl;
-        //epicsExitCallAtExits();
-    }
-
-    return allOK ? 0 : 1;
+    return haderror ? 1 : 0;
 }

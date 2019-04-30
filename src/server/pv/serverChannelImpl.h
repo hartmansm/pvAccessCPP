@@ -7,143 +7,78 @@
 #ifndef SERVERCHANNEL_H_
 #define SERVERCHANNEL_H_
 
-#ifdef epicsExportSharedSymbols
-#   define serverChannelImplEpicsExportSharedSymbols
-#   undef epicsExportSharedSymbols
-#endif
-
 #include <pv/destroyable.h>
-
-#ifdef serverChannelImplEpicsExportSharedSymbols
-#   define epicsExportSharedSymbols
-#	undef serverChannelImplEpicsExportSharedSymbols
-#endif
-
 #include <pv/remote.h>
-#include <pv/clientContextImpl.h>
 #include <pv/security.h>
+#include <pv/baseChannelRequester.h>
 
 namespace epics {
 namespace pvAccess {
 
-class ServerChannelImpl : public ServerChannel
+class BaseChannelRequester;
+
+class ServerChannel
 {
 public:
-	POINTER_DEFINITIONS(ServerChannelImpl);
+    POINTER_DEFINITIONS(ServerChannel);
 
-	/**
-	 * Create server channel for given process variable.
-	 * @param channel local channel.
-	 * @param cid channel CID.
-	 * @param sid channel SID.
+    static size_t num_instances;
+
+    /**
+     * Create server channel for given process variable.
+     * @param channel local channel.
+     * @param cid channel CID.
+     * @param sid channel SID.
      * @param css channel security session.
-	 */
-    ServerChannelImpl(Channel::shared_pointer const & channel, pvAccessID cid, pvAccessID sid, ChannelSecuritySession::shared_pointer const & css);
-	/*
-	 * Destructor.
-	 */
-	virtual ~ServerChannelImpl();
-
-	/**
-	 * Get local channel.
-	 * @return local channel.
-	 */
-	Channel::shared_pointer getChannel();
-
-	/**
-	 * Get channel CID.
-	 * @return channel CID.
-	 */
-	pvAccessID getCID() const;
-
-	/**
-	 * Get channel SID.
-	 * @return channel SID.
-	 */
-	pvAccessID getSID() const;
-
-    /**
-     * Get ChannelSecuritySession instance.
-     * @return the ChannelSecuritySession instance.
      */
-    ChannelSecuritySession::shared_pointer getChannelSecuritySession() const;
+    ServerChannel(Channel::shared_pointer const & channel,
+                      const ChannelRequester::shared_pointer& requester,
+                      pvAccessID cid, pvAccessID sid,
+                      ChannelSecuritySession::shared_pointer const & css);
+    ~ServerChannel();
 
-	/**
-	 * Register request
-	 * @param id request ID.
-	 * @param request request to be registered.
-	 */
-	void registerRequest(pvAccessID id, epics::pvData::Destroyable::shared_pointer const & request);
+    const Channel::shared_pointer& getChannel() const { return _channel; }
 
-	/**
-	 * Unregister request.
-	 * @param id request ID.
-	 */
-	void unregisterRequest(pvAccessID id);
+    pvAccessID getCID() const { return _cid; }
 
-    /**
-     * Get request by its ID.
-     * @param id request ID.
-     * @return request with given ID, <code>null</code> if there is no request with such ID.
-     */
-    epics::pvData::Destroyable::shared_pointer getRequest(pvAccessID id);
+    pvAccessID getSID() const { return _sid; }
 
-    /**
-     * Destroy server channel.
-     */
-	void destroy();
+    ChannelSecuritySession::shared_pointer getChannelSecuritySession() const
+    { return _channelSecuritySession; }
 
-	/**
-	 * Prints detailed information about the process variable to the standard output stream.
-	 */
-	void printInfo();
+    void registerRequest(pvAccessID id, const std::tr1::shared_ptr<BaseChannelRequester>& request);
 
-	/**
-	 * Prints detailed information about the process variable to the specified output
-	 * stream.
-	 * @param fd the output stream.
-	 */
-	void printInfo(FILE *fd);
+    void unregisterRequest(pvAccessID id);
+
+    void installGetField(const GetFieldRequester::shared_pointer& gf);
+    void completeGetField(GetFieldRequester *req);
+
+    //! may return NULL
+    std::tr1::shared_ptr<BaseChannelRequester> getRequest(pvAccessID id);
+
+    void destroy();
+
+    void printInfo() const;
+
+    void printInfo(FILE *fd) const;
 private:
-	/**
-	 * Local channel.
-	 */
-	Channel::shared_pointer _channel;
+    const Channel::shared_pointer _channel;
 
-	/**
-	 * Channel CID.
-	 */
-	pvAccessID _cid;
+    const ChannelRequester::shared_pointer _requester;
 
-	/**
-	 * Channel SID.
-	 */
-	pvAccessID _sid;
+    const pvAccessID _cid, _sid;
 
-	/**
-	 * Requests.
-	 */
-	std::map<pvAccessID, epics::pvData::Destroyable::shared_pointer> _requests;
+    //! keep alive in-progress GetField()
+    GetFieldRequester::shared_pointer _active_requester;
 
-	/**
-	 * Destroy state.
-	 */
-	bool _destroyed;
+    typedef std::map<pvAccessID, std::tr1::shared_ptr<BaseChannelRequester> > _requests_t;
+    _requests_t _requests;
 
-	/**
-	 * Mutex
-	 */
-	epics::pvData::Mutex _mutex;
+    bool _destroyed;
 
-    /**
-     * Channel security session.
-     */
-    ChannelSecuritySession::shared_pointer _channelSecuritySession;
+    mutable epics::pvData::Mutex _mutex;
 
-	/**
-	 * Destroy all registered requests.
-	 */
-	void destroyAllRequests();
+    const ChannelSecuritySession::shared_pointer _channelSecuritySession;
 };
 
 }

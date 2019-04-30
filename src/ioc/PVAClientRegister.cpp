@@ -11,52 +11,9 @@
 
 /* Author: Marty Kraimer */
 
-#include <cstddef>
-#include <cstdlib>
-#include <cstddef>
-#include <string>
-#include <cstdio>
-#include <memory>
-#include <iostream>
-
-#include <iocsh.h>
-#include <epicsExit.h>
-
 #include <epicsExport.h>
 
-#include <pv/pvAccess.h>
-#include <pv/clientFactory.h>
-
-using std::cout;
-using std::endl;
-using namespace epics::pvData;
-using namespace epics::pvAccess;
-
-//static void pvaClientExitHandler(void* /*pPrivate*/) {
-//cout << "pvaClientExitHandler\n";
-//    ClientFactory::stop();
-//}
-
-static const iocshFuncDef startPVAClientFuncDef = {
-    "startPVAClient", 0, 0
-};
-
-extern "C" void startPVAClient(const iocshArgBuf *args)
-{
-    ClientFactory::start();
-//    epicsAtExit(pvaClientExitHandler, NULL);
-}
-
-
-static void registerStartPVAClient(void)
-{
-    static int firstTime = 1;
-    if (firstTime) {
-        firstTime = 0;
-        iocshRegister(&startPVAClientFuncDef, startPVAClient);
-    }
-}
-
+static void registerStartPVAClient(void) {}
 
 extern "C" {
     epicsExportRegistrar(registerStartPVAClient);

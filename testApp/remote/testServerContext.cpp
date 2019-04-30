@@ -4,6 +4,9 @@
 
 #include <pv/serverContext.h>
 #include <epicsExit.h>
+#include <testMain.h>
+
+#include <epicsUnitTest.h>
 
 using namespace epics::pvAccess;
 using namespace epics::pvData;
@@ -12,16 +15,19 @@ using namespace std;
 class TestChannelProvider : public ChannelProvider
 {
 public:
-       
-    std::string getProviderName() { return "local"; };
-    
+
+    std::string getProviderName() {
+        return "local";
+    };
+
+    TestChannelProvider() {}
 
     ChannelFind::shared_pointer channelFind(std::string const & /*channelName*/,
                                             ChannelFindRequester::shared_pointer const & channelFindRequester)
     {
         ChannelFind::shared_pointer nullCF;
-        channelFindRequester->channelFindResult(Status::Ok, nullCF, false); 
-        return nullCF;  
+        channelFindRequester->channelFindResult(Status::Ok, nullCF, false);
+        return nullCF;
     }
 
     ChannelFind::shared_pointer channelList(ChannelListRequester::shared_pointer const & channelListRequester)
@@ -33,78 +39,51 @@ public:
     }
 
     Channel::shared_pointer createChannel(
-                std::string const & channelName,
-                ChannelRequester::shared_pointer const & channelRequester,
-                short priority = PRIORITY_DEFAULT)  
+        std::string const & channelName,
+        ChannelRequester::shared_pointer const & channelRequester,
+        short priority = PRIORITY_DEFAULT)
     {
         return createChannel(channelName, channelRequester, priority, "");
     }
 
     Channel::shared_pointer createChannel(
-                std::string const & /*channelName*/,
-                ChannelRequester::shared_pointer const & channelRequester,
-                short /*priority*/, std::string const & /*address*/)
+        std::string const & /*channelName*/,
+        ChannelRequester::shared_pointer const & channelRequester,
+        short /*priority*/, std::string const & /*address*/)
     {
         Channel::shared_pointer nullC;
         channelRequester->channelCreated(Status::Ok, nullC);
-        return nullC;    
+        return nullC;
     }
-    
+
     void destroy()
     {
     }
 };
 
-
-class TestChannelProviderRegistry : public ChannelProviderRegistry {
-public:
-                
-    virtual ~TestChannelProviderRegistry() {};
-            
-    ChannelProvider::shared_pointer getProvider(std::string const & providerName)
-    {
-        if (providerName == "local")
-        {
-            return ChannelProvider::shared_pointer(new TestChannelProvider()); 
-        }
-        else
-            return ChannelProvider::shared_pointer(); 
-    }
-            
-    ChannelProvider::shared_pointer createProvider(std::string const & providerName)
-    {
-        return getProvider(providerName);
-    }
-
-    std::auto_ptr<stringVector_t> getProviderNames()
-    {
-        std::auto_ptr<stringVector_t> pn(new stringVector_t());
-        pn->push_back("local");
-        return pn;
-    }
-};
-
 void testServerContext()
 {
+    ChannelProvider::shared_pointer prov(new TestChannelProvider);
+    ServerContext::shared_pointer ctx(ServerContext::create(ServerContext::Config()
+                                                                .provider(prov)));
+    ServerContext::weak_pointer wctx(ctx);
 
-	ServerContextImpl::shared_pointer ctx = ServerContextImpl::create();
+    testOk(ctx.unique(), "# ServerContext::create() returned non-unique instance use_count=%u", (unsigned)ctx.use_count());
 
-	ChannelProviderRegistry::shared_pointer ca(new TestChannelProviderRegistry());
-	ctx->initialize(ca);
+    ctx->printInfo();
 
-	ctx->printInfo();
+    ctx->run(1);
 
-	ctx->run(1);
+    ctx.reset();
 
-	ctx->destroy();
+    testOk(!wctx.lock(), "# ServerContext cleanup leaves use_count=%u", (unsigned)wctx.use_count());
 }
 
-int main()
+MAIN(testServerContext)
 {
-	testServerContext();
+    testPlan(0);
 
-	cout << "Done" << endl;
+    testServerContext();
 
-	//epicsExitCallAtExits();
-    return (0);
+    return testDone();
 }

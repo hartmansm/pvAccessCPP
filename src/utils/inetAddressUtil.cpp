@@ -9,46 +9,28 @@
 #include <cstdlib>
 #include <sstream>
 
-#include <pv/byteBuffer.h>
-#include <pv/epicsException.h>
 #include <osiSock.h>
 #include <ellLib.h>
+#include <errlog.h>
+
+#include <pv/pvType.h>
+#include <pv/byteBuffer.h>
+#include <pv/epicsException.h>
 
 #define epicsExportSharedSymbols
 #include <pv/inetAddressUtil.h>
+
+// RTEMS 4.9 doesn't define this, but does implement SIOCGIFNETMASK
+// and stores under the ifr_addr union member.
+#ifndef ifr_netmask
+#  define ifr_netmask ifr_addr
+#endif
 
 using namespace std;
 using namespace epics::pvData;
 
 namespace epics {
 namespace pvAccess {
-
-void addDefaultBroadcastAddress(InetAddrVector* v, unsigned short p) {
-    osiSockAddr pNewNode;
-    pNewNode.ia.sin_family = AF_INET;
-    pNewNode.ia.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    pNewNode.ia.sin_port = htons(p);
-    v->push_back(pNewNode);
-}
-
-InetAddrVector* getBroadcastAddresses(SOCKET sock, 
-        unsigned short defaultPort) {
-    ELLLIST as;
-    ellInit(&as);
-    osiSockAddr serverAddr;
-    memset(&serverAddr, 0, sizeof(osiSockAddr));
-    InetAddrVector * v = new InetAddrVector;
-    osiSockDiscoverBroadcastAddresses(&as, sock, &serverAddr);
-    for(ELLNODE * n = ellFirst(&as); n != NULL; n = ellNext(n))
-    {
-        osiSockAddrNode * sn = (osiSockAddrNode *)n;
-        sn->addr.ia.sin_port = htons(defaultPort);
-        // TODO discover possible duplicates
-        v->push_back(sn->addr);
-    }
-    ellFree(&as);
-    return v;
-}
 
 void encodeAsIPv6Address(ByteBuffer* buffer, const osiSockAddr* address) {
     // IPv4 compatible IPv6 address
@@ -75,11 +57,13 @@ bool decodeAsIPv6Address(ByteBuffer* buffer, osiSockAddr* address) {
     // allow all zeros address
     //if (ffff != (int16)0xFFFF) return false;
 
-    uint32_t ipv4Addr =
-        ((uint32_t)(buffer->getByte()&0xFF))<<24 |
-        ((uint32_t)(buffer->getByte()&0xFF))<<16 |
-        ((uint32_t)(buffer->getByte()&0xFF))<<8  |
-        ((uint32_t)(buffer->getByte()&0xFF));
+    uint32 ipv4Addr = uint8(buffer->getByte());
+    ipv4Addr <<= 8;
+    ipv4Addr |= uint8(buffer->getByte());
+    ipv4Addr <<= 8;
+    ipv4Addr |= uint8(buffer->getByte());
+    ipv4Addr <<= 8;
+    ipv4Addr |= uint8(buffer->getByte());
 
     if (ffff != (int16)0xFFFF && ipv4Addr != (uint32_t)0)
         return false;
@@ -95,56 +79,10 @@ bool isMulticastAddress(const osiSockAddr* address) {
     return msB >= 224 && msB <= 239;
 }
 
-osiSockAddr* intToIPv4Address(int32 addr) {
-    osiSockAddr* ret = new osiSockAddr;
-    ret->ia.sin_family = AF_INET;
-    ret->ia.sin_addr.s_addr = htonl(addr);
-    ret->ia.sin_port = 0;
-
-    return ret;
-}
-
-int32 ipv4AddressToInt(const osiSockAddr& addr) {
-    return (int32)ntohl(addr.ia.sin_addr.s_addr);
-}
-
-int32 parseInetAddress(const string & addr) {
-    int32 retAddr;
-
-    size_t dot = addr.find('.');
-    if(dot==std::string::npos) THROW_BASE_EXCEPTION("Not an IPv4 address.");
-    int byte = atoi(addr.substr(0, dot).c_str());
-    if(byte<0||byte>255) THROW_BASE_EXCEPTION("Not an IPv4 address.");
-    retAddr = byte;
-
-    int num = dot+1;
-    dot = addr.find('.', num);
-    if(dot==std::string::npos) THROW_BASE_EXCEPTION("Not an IPv4 address.");
-    byte = atoi(addr.substr(num, dot-num).c_str());
-    if(byte<0||byte>255) THROW_BASE_EXCEPTION("Not an IPv4 address.");
-    retAddr <<= 8;
-    retAddr |= byte;
-
-    num = dot+1;
-    dot = addr.find('.', num);
-    if(dot==std::string::npos) THROW_BASE_EXCEPTION("Not an IPv4 address.");
-    byte = atoi(addr.substr(num, dot-num).c_str());
-    if(byte<0||byte>255) THROW_BASE_EXCEPTION("Not an IPv4 address.");
-    retAddr <<= 8;
-    retAddr |= byte;
-
-    num = dot+1;
-    byte = atoi(addr.substr(num).c_str());
-    if(byte<0||byte>255) THROW_BASE_EXCEPTION("Not an IPv4 address.");
-    retAddr <<= 8;
-    retAddr |= byte;
-
-    return htonl(retAddr);
-}
-
-InetAddrVector* getSocketAddressList(const std::string & list, int defaultPort,
-        const InetAddrVector* appendList) {
-    InetAddrVector* iav = new InetAddrVector();
+void getSocketAddressList(InetAddrVector& ret,
+                          const std::string & list, int defaultPort,
+                                     const InetAddrVector* appendList) {
+    ret.clear();
 
     // skip leading spaces
     size_t len = list.length();
@@ -158,25 +96,24 @@ InetAddrVector* getSocketAddressList(const std::string & list, int defaultPort,
         string address = list.substr(subStart, (subEnd-subStart));
         osiSockAddr addr;
         if (aToIPAddr(address.c_str(), defaultPort, &addr.ia) == 0)
-            iav->push_back(addr);
+            ret.push_back(addr);
         subStart = list.find_first_not_of(" \t\r\n\v", subEnd);
     }
 
     if(subStart!=std::string::npos && subStart<len) {
         osiSockAddr addr;
         if (aToIPAddr(list.substr(subStart).c_str(), defaultPort, &addr.ia) == 0)
-            iav->push_back(addr);
+            ret.push_back(addr);
     }
 
     if(appendList!=NULL) {
         for(size_t i = 0; i<appendList->size(); i++)
-        	iav->push_back((*appendList)[i]);
+            ret.push_back((*appendList)[i]);
     }
-    return iav;
 }
 
 string inetAddressToString(const osiSockAddr &addr,
-        bool displayPort, bool displayHex) {
+                           bool displayPort, bool displayHex) {
     stringstream saddr;
 
     int ipa = ntohl(addr.ia.sin_addr.s_addr);
@@ -187,26 +124,355 @@ string inetAddressToString(const osiSockAddr &addr,
     saddr<<((int)ipa&0xFF);
     if(displayPort) saddr<<":"<<ntohs(addr.ia.sin_port);
     if(displayHex) saddr<<" ("<<hex<<ntohl(addr.ia.sin_addr.s_addr)
-            <<")";
+                            <<")";
 
     return saddr.str();
 }
 
-int getLoopbackNIF(osiSockAddr &loAddr, string const & localNIF, unsigned short port)
+ifaceNode::ifaceNode()
 {
-    if (!localNIF.empty())
-    {
-        if (aToIPAddr(localNIF.c_str(), port, &loAddr.ia) == 0)
-            return 0;
-        // else TODO log error
+    memset(&addr, 0, sizeof(addr));
+    memset(&peer, 0, sizeof(peer));
+    memset(&bcast, 0, sizeof(bcast));
+    memset(&mask, 0, sizeof(mask));
+    validBcast = validP2P = loopback = false;
+}
+
+static
+void checkNode(ifaceNode& node)
+{
+    if(node.validBcast) {
+        /* Cross-check between addr, mask, and bcast to detect incorrect broadcast
+         * address.  Why do admins insist on setting this seperately?!?
+         */
+        uint32 addr = ntohl(node.addr.ia.sin_addr.s_addr),
+               mask = ntohl(node.mask.ia.sin_addr.s_addr),
+               bcast= ntohl(node.bcast.ia.sin_addr.s_addr),
+               bcast_expect = (addr & mask) | ~mask;
+
+        if(bcast == ntohl(INADDR_BROADCAST)) {
+            // translate global broadcast to iface broadcast.
+            // Windows (at least) will give us this sometimes.
+            bcast = bcast_expect;
+            node.bcast.ia.sin_addr.s_addr = htonl(bcast);
+        }
+
+        if(bcast != bcast_expect) {
+            errlogPrintf("Warning: Inconsistent broadcast address on interface %08x/%08x.  expect %08x found %08x.\n",
+                         (unsigned)addr, (unsigned)mask, (unsigned)bcast_expect, (unsigned)bcast);
+        }
+    }
+}
+
+#if !defined(_WIN32)
+
+/*
+ * Determine the size of an ifreq structure
+ * Made difficult by the fact that addresses larger than the structure
+ * size may be returned from the kernel.
+ */
+static size_t ifreqSize ( struct ifreq *pifreq )
+{
+    size_t        size;
+
+    size = ifreq_size ( pifreq );
+    if ( size < sizeof ( *pifreq ) ) {
+        size = sizeof ( *pifreq );
+    }
+    return size;
+}
+
+/*
+ * Move to the next ifreq structure
+ */
+static struct ifreq * ifreqNext ( struct ifreq *pifreq )
+{
+    struct ifreq *ifr;
+
+    ifr = ( struct ifreq * )( ifreqSize (pifreq) + ( char * ) pifreq );
+    return ifr;
+}
+
+int discoverInterfaces(IfaceNodeVector &list, SOCKET socket, const osiSockAddr *pMatchAddr)
+{
+    static const unsigned           nelem = 100;
+    int                             status;
+    struct ifconf                   ifconf;
+    struct ifreq                    *pIfreqList;
+    struct ifreq                    *pIfreqListEnd;
+    struct ifreq                    *pifreq;
+    struct ifreq                    *pnextifreq;
+    int                             match;
+
+    /*
+     * use pool so that we avoid using too much stack space
+     *
+     * nelem is set to the maximum interfaces
+     * on one machine here
+     */
+    pIfreqList = (struct ifreq *) calloc ( nelem, sizeof(*pifreq) );
+    if (!pIfreqList) {
+        errlogPrintf ("discoverInterfaces(): no memory to complete request\n");
+        return -1;
     }
 
-    // fallback
-    loAddr.ia.sin_family = AF_INET;
-    loAddr.ia.sin_port = ntohs(port);
-    loAddr.ia.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    return 1;
+    ifconf.ifc_len = nelem * sizeof(*pifreq);
+    ifconf.ifc_req = pIfreqList;
+    status = socket_ioctl (socket, SIOCGIFCONF, &ifconf);
+    if (status < 0 || ifconf.ifc_len == 0) {
+        errlogPrintf ("discoverInterfaces(): unable to fetch network interface configuration\n");
+        free (pIfreqList);
+        return -1;
+    }
+
+    pIfreqListEnd = (struct ifreq *) (ifconf.ifc_len + (char *) pIfreqList);
+    pIfreqListEnd--;
+
+    for ( pifreq = pIfreqList; pifreq <= pIfreqListEnd; pifreq = pnextifreq ) {
+        uint32_t  current_ifreqsize;
+
+        /*
+         * find the next ifreq
+         */
+        pnextifreq = ifreqNext (pifreq);
+
+        /* determine ifreq size */
+        current_ifreqsize = ifreqSize ( pifreq );
+        /* copy current ifreq to aligned bufferspace (to start of pIfreqList buffer) */
+        /* be careful as we re-use part of this space several times below.
+         * Any member other than ifr_name is invalidated by an ioctl() call
+         */
+        memmove(pIfreqList, pifreq, current_ifreqsize);
+
+        /*
+         * If its not an internet interface then dont use it
+         */
+        if ( pIfreqList->ifr_addr.sa_family != AF_INET ) {
+            continue;
+        }
+
+        /*
+         * if it isnt a wildcarded interface then look for
+         * an exact match
+         */
+        match = 0;
+        if ( pMatchAddr && pMatchAddr->sa.sa_family != AF_UNSPEC ) {
+            if ( pMatchAddr->sa.sa_family != AF_INET ) {
+                continue;
+            }
+            if ( pMatchAddr->ia.sin_addr.s_addr != htonl (INADDR_ANY) ) {
+                struct sockaddr_in *pInetAddr = (struct sockaddr_in *) &pIfreqList->ifr_addr;
+                if ( pInetAddr->sin_addr.s_addr != pMatchAddr->ia.sin_addr.s_addr ) {
+                    continue;
+                }
+                else
+                    match = 1;
+            }
+        }
+
+        ifaceNode node;
+        node.addr.sa = pIfreqList->ifr_addr;
+
+        status = socket_ioctl ( socket, SIOCGIFFLAGS, pIfreqList );
+        if ( status ) {
+            errlogPrintf ("discoverInterfaces(): net intf flags fetch for \"%s\" failed\n", pIfreqList->ifr_name);
+            continue;
+        }
+
+        unsigned short ifflags = pIfreqList->ifr_flags;
+        node.loopback = ifflags & IFF_LOOPBACK;
+
+        /*
+         * dont bother with interfaces that have been disabled
+         */
+        if ( ! ( ifflags & IFF_UP ) ) {
+            continue;
+        }
+
+        /*
+         * dont use the loop back interface, unless it maches pMatchAddr
+         */
+        if (!match) {
+            if ( ifflags & IFF_LOOPBACK ) {
+                continue;
+            }
+        }
+
+        /*
+         * If this is an interface that supports
+         * broadcast fetch the broadcast address.
+         *
+         * Otherwise if this is a point to point
+         * interface then use the destination address.
+         *
+         * Otherwise CA will not query through the
+         * interface.
+         */
+        if ( ifflags & IFF_BROADCAST ) {
+            status = socket_ioctl (socket, SIOCGIFBRDADDR, pIfreqList);
+            if ( status ) {
+                errlogPrintf ("discoverInterfaces(): net intf \"%s\": bcast addr fetch fail\n", pIfreqList->ifr_name);
+                continue;
+            }
+            node.bcast.sa = pIfreqList->ifr_broadaddr;
+
+            status = socket_ioctl (socket, SIOCGIFNETMASK, pIfreqList);
+            if ( status ) {
+                errlogPrintf ("discoverInterfaces(): net intf \"%s\": netmask fetch fail\n", pIfreqList->ifr_name);
+                continue;
+            }
+            node.mask.sa = pIfreqList->ifr_netmask;
+
+            checkNode(node);
+
+            node.validBcast = true;
+        }
+#if defined (IFF_POINTOPOINT)
+        else if ( ifflags & IFF_POINTOPOINT ) {
+            status = socket_ioctl ( socket, SIOCGIFDSTADDR, pIfreqList);
+            if ( status ) {
+                continue;
+            }
+            node.peer.sa = pIfreqList->ifr_dstaddr;
+            node.validP2P = true;
+        }
+#endif
+        else {
+            // if it is a match, accept the interface even if it does not support broadcast (i.e. 127.0.0.1 or point to point)
+            if (!match)
+            {
+                continue;
+            }
+        }
+
+        list.push_back(node);
+    }
+
+    free ( pIfreqList );
+    return 0;
 }
+
+
+#else
+
+#define VC_EXTRALEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+int discoverInterfaces(IfaceNodeVector &list, SOCKET socket, const osiSockAddr *pMatchAddr)
+{
+    int             	status;
+    INTERFACE_INFO      *pIfinfo;
+    INTERFACE_INFO      *pIfinfoList;
+    unsigned			nelem;
+    int					numifs;
+    DWORD				cbBytesReturned;
+    int					match;
+
+    /* only valid for winsock 2 and above
+    TODO resolve dllimport compilation problem and uncomment this check
+    if (wsaMajorVersion() < 2 ) {
+        fprintf(stderr, "Need to set EPICS_CA_AUTO_ADDR_LIST=NO for winsock 1\n");
+        return -1;
+    }
+    */
+
+    nelem = 100;
+    pIfinfoList = (INTERFACE_INFO *) calloc(nelem, sizeof(INTERFACE_INFO));
+    if(!pIfinfoList) {
+        return -1;
+    }
+
+    status = WSAIoctl (socket, SIO_GET_INTERFACE_LIST,
+                       NULL, 0,
+                       (LPVOID)pIfinfoList, nelem*sizeof(INTERFACE_INFO),
+                       &cbBytesReturned, NULL, NULL);
+
+    if (status != 0 || cbBytesReturned == 0) {
+        fprintf(stderr, "WSAIoctl SIO_GET_INTERFACE_LIST failed %d\n",WSAGetLastError());
+        free(pIfinfoList);
+        return -1;
+    }
+
+    numifs = cbBytesReturned/sizeof(INTERFACE_INFO);
+    for (pIfinfo = pIfinfoList; pIfinfo < (pIfinfoList+numifs); pIfinfo++) {
+
+        /*
+         * dont bother with interfaces that have been disabled
+         */
+        if (!(pIfinfo->iiFlags & IFF_UP)) {
+            continue;
+        }
+
+        /*
+         * If its not an internet interface then dont use it
+         * + work around WS2 bug
+         */
+        if (pIfinfo->iiAddress.Address.sa_family != AF_INET) {
+            if (pIfinfo->iiAddress.Address.sa_family == 0) {
+                pIfinfo->iiAddress.Address.sa_family = AF_INET;
+            }
+            else
+                continue;
+        }
+
+        /*
+         * if it isnt a wildcarded interface then look for
+         * an exact match
+         */
+        match = 0;
+        if (pMatchAddr && pMatchAddr->sa.sa_family != AF_UNSPEC) {
+            if (pIfinfo->iiAddress.Address.sa_family != pMatchAddr->sa.sa_family) {
+                continue;
+            }
+            if (pIfinfo->iiAddress.Address.sa_family != AF_INET) {
+                continue;
+            }
+            if (pMatchAddr->sa.sa_family != AF_INET) {
+                continue;
+            }
+            if (pMatchAddr->ia.sin_addr.s_addr != htonl(INADDR_ANY)) {
+                if (pIfinfo->iiAddress.AddressIn.sin_addr.s_addr != pMatchAddr->ia.sin_addr.s_addr) {
+                    continue;
+                }
+                else
+                    match = 1;
+            }
+        }
+
+        /*
+         * dont use the loop back interface, unless it maches pMatchAddr
+         */
+        if (!match) {
+            if (pIfinfo->iiFlags & IFF_LOOPBACK) {
+                continue;
+            }
+        }
+
+        ifaceNode node;
+        node.loopback = pIfinfo->iiFlags & IFF_LOOPBACK;
+        node.addr.ia = pIfinfo->iiAddress.AddressIn;
+
+        if (pIfinfo->iiFlags & IFF_BROADCAST) {
+            node.mask.ia = pIfinfo->iiNetmask.AddressIn;
+            node.bcast.ia = pIfinfo->iiBroadcastAddress.AddressIn;
+            node.validBcast = true;
+        }
+        else if (pIfinfo->iiFlags & IFF_POINTTOPOINT) {
+            node.peer.ia = pIfinfo->iiNetmask.AddressIn;
+            node.validP2P = true;
+        }
+
+        checkNode(node);
+
+        list.push_back(node);
+    }
+
+    free (pIfinfoList);
+    return 0;
+}
+
+#endif
 
 }
 }

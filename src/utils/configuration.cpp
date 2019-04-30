@@ -7,8 +7,10 @@
 #include <algorithm>
 
 #include <pv/epicsException.h>
+#include <pv/typeCast.h>
 
 #include <osiSock.h>
+#include <epicsStdlib.h>
 
 #define epicsExportSharedSymbols
 #include <pv/configuration.h>
@@ -24,322 +26,62 @@ namespace pvAccess {
 using namespace epics::pvData;
 using namespace std;
 
-Properties::Properties()
+Configuration::~Configuration() {}
+
+bool Configuration::getPropertyAsBoolean(const std::string &name, const bool defaultValue) const
 {
-	_fileName = "";
-	_infile.reset(new ifstream());
-	_infile->exceptions (ifstream::failbit | ifstream::badbit );
-	_outfile.reset(new ofstream());
-	_outfile->exceptions (ofstream::failbit | ofstream::badbit );
-}
+    string value = getPropertyAsString(name, defaultValue ? "1" : "0");
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
 
-Properties::Properties(const string &fileName)
-{
-	_fileName = fileName;
-	_infile.reset(new ifstream());
-	_infile->exceptions (ifstream::failbit | ifstream::badbit );
-	_outfile.reset(new ofstream());
-	_outfile->exceptions (ofstream::failbit | ofstream::badbit );
-}
-
-Properties::~Properties()
-{
-}
-
-void Properties::setProperty(const string &key, const string &value)
-{
-	string oldValue;
-	std::map<std::string,std::string>::iterator propertiesIterator = _properties.find(key);
-
-	if(propertiesIterator != _properties.end()) //found in map
-	{
-		_properties.erase(propertiesIterator);
-	}
-	_properties[key] = value;
-}
-
-string Properties::getProperty(const string &key)
-{
-	std::map<std::string,std::string>::iterator propertiesIterator = _properties.find(key);
-	if(propertiesIterator != _properties.end()) //found in map
-	{
-		return string(propertiesIterator->second);
-	}
-	else
-	{
-		string errMsg = "Property not found in the map: " + key;
-		THROW_BASE_EXCEPTION(errMsg.c_str());
-	}
-}
-
-string Properties::getProperty(const string &key, const string &defaultValue)
-{
-	std::map<std::string,std::string>::iterator propertiesIterator = _properties.find(key);
-	if(propertiesIterator != _properties.end()) //found in map
-	{
-		return string(propertiesIterator->second);
-	}
-
-	return defaultValue;
-}
-
-bool Properties::hasProperty(const string &key)
-{
-    return (_properties.find(key) != _properties.end());
-}
-
-void Properties::load()
-{
-	_properties.clear();
-
-#ifdef NO_STREAM_EXCEPTIONS
-	_infile->open(_fileName.c_str(),ifstream::in);
-	if (_infile->fail())
-#else
-	try
-	{
-		_infile->open(_fileName.c_str(),ifstream::in);
-	}
-	catch (ifstream::failure& e)
-#endif
-	{
-		string errMsg = "Error opening file: " + string(_fileName.c_str());
-		THROW_BASE_EXCEPTION(errMsg.c_str());
-	}
-
-	string line;
-	string property;
-	string key;
-#ifndef NO_STREAM_EXCEPTIONS
-	try
-	{
-#endif
-		while(!_infile->eof())
-		{
-			line.erase();
-			std::getline(*_infile,line);
-
-#ifdef NO_STREAM_EXCEPTIONS
-			if (_infile->fail())
-			{
-				_infile->close();
-				if(_infile->eof())
-				{
-					return; //end of file
-				}
-				string errMsg = "Error reading file: " + _fileName;
-				THROW_BASE_EXCEPTION(errMsg.c_str());
-			}
-#endif
-
-			//remove trailing spaces
-			truncate(line);
-
-			//empty line
-			if(line.length() == 0)
-			{
-				continue;
-			}
-			// comment
-			if(line[0] == '#')
-			{
-				continue;
-			}
-
-			//line is in format: propertyName=propertyValue
-			size_t pos = line.find_first_of('=',0);
-			if(pos == string::npos) //bad value (= not found)
-			{
-				string errMsg = "Bad property line found: " + line;
-				THROW_BASE_EXCEPTION(errMsg.c_str());
-			}
-
-			key = line.substr(0,pos);
-			truncate(key);
-			property = line.substr(pos + 1,line.length());
-			truncate(property);
-			_properties[key] = property;
-		}
-#ifndef NO_STREAM_EXCEPTIONS
-	}
-	catch (ifstream::failure& e)
-	{
-		_infile->close();
-		if(_infile->eof())
-		{
-			return; //end of file
-		}
-		string errMsg = "Error reading file: " + _fileName;
-		THROW_BASE_EXCEPTION(errMsg.c_str());
-	}
-#endif
-	_infile->close();
-}
-
-void Properties::load(const string &fileName)
-{
-	_fileName = fileName;
-	load();
-}
-
-void Properties::store()
-{
-#ifdef NO_STREAM_EXCEPTIONS
-	_outfile->open(_fileName.c_str(),ifstream::trunc);
-	if (_outfile->fail())
-#else
-	try
-	{
-		_outfile->open(_fileName.c_str(),ifstream::trunc);
-	}
-	catch (ofstream::failure& e)
-#endif
-	{
-		string errMsg = "Error opening file: " + string(_fileName.c_str());
-		THROW_BASE_EXCEPTION(errMsg.c_str());
-	}
-
-
-	for (std::map<std::string,std::string>::iterator propertiesIterator = _properties.begin();
-			propertiesIterator != _properties.end();
-			propertiesIterator++ )
-	{
-#ifndef NO_STREAM_EXCEPTIONS
-		try
-		{
-#endif
-			string line = string(propertiesIterator->first) + string("=") + string(propertiesIterator->second) + string("\n");
-			_outfile->write(line.c_str(),line.length());
-#ifdef NO_STREAM_EXCEPTIONS
-			if(_outfile->fail())
-#else
-		}
-		catch (ofstream::failure& e)
-#endif
-		{
-			_outfile->close();
-			string errMsg = "Error writing to file: " + string(_fileName.c_str());
-			THROW_BASE_EXCEPTION(errMsg.c_str());
-		}
-	}
-	_outfile->close();
-}
-
-void Properties::store(const string &fileName)
-{
-	_fileName = fileName;
-	store();
-}
-
-void Properties::list()
-{
-	for (std::map<std::string,std::string>::iterator propertiesIterator =  _properties.begin() ;
-			propertiesIterator != _properties.end();
-			propertiesIterator++ )
-	{
-		cout << "Key:" << propertiesIterator->first << ",Value: " << propertiesIterator->second << endl;
-	}
-}
-
-SystemConfigurationImpl::SystemConfigurationImpl() :
-		_properties(new Properties())
-{
-	// no exception, default value is taken
-	//_ibuffer.exceptions ( ifstream::failbit | ifstream::badbit );
-	//_obuffer.exceptions ( ifstream::failbit | ifstream::badbit );
-}
-
-SystemConfigurationImpl::~SystemConfigurationImpl()
-{
-}
-
-bool SystemConfigurationImpl::getPropertyAsBoolean(const string &name, const bool defaultValue)
-{
-	/*
-	bool retval;
-	_ibuffer.clear();
-	_obuffer.clear();
-	_obuffer.str("");
-	_obuffer << defaultValue;
-	_ibuffer.str(getPropertyAsString(name,_obuffer.str()));
-	_ibuffer >> retval;
-	if (_ibuffer.fail() || _ibuffer.bad())
-        return defaultValue;
-    else
-        return retval;
-        */
-
-	string value = getPropertyAsString(name, defaultValue ? "1" : "0");
-	std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-
-	bool isTrue = (value == "1") || (value == "true") || (value == "yes");
+    bool isTrue = (value == "1") || (value == "true") || (value == "yes");
     if (isTrue)
         return true;
 
-	bool isFalse = (value == "0") || (value == "false") || (value == "no");
+    bool isFalse = (value == "0") || (value == "false") || (value == "no");
     if (isFalse)
         return false;
 
-	// invalid value
+    // invalid value
     return defaultValue;
 }
 
-int32 SystemConfigurationImpl::getPropertyAsInteger(const string &name, const int32 defaultValue)
+epics::pvData::int32 Configuration::getPropertyAsInteger(const std::string &name, const epics::pvData::int32 defaultValue) const
 {
-    int32 retval = defaultValue;
-	_ibuffer.clear();
-	_obuffer.clear();
-	_obuffer.str("");
-	_obuffer << defaultValue;
-	_ibuffer.str(getPropertyAsString(name, _obuffer.str()));
-	_ibuffer >> retval;
-	if (_ibuffer.fail() || _ibuffer.bad())
+    try {
+        return castUnsafe<epics::pvData::int32>(getPropertyAsString(name, ""));
+    } catch(std::runtime_error&) {
         return defaultValue;
-    else
-        return retval;
+    }
 }
 
-float SystemConfigurationImpl::getPropertyAsFloat(const string &name, const float defaultValue)
+float Configuration::getPropertyAsFloat(const std::string &name, const float defaultValue) const
 {
-	float retval;
-	_ibuffer.clear();
-	_obuffer.clear();
-	_obuffer.str("");
-	_obuffer << defaultValue;
-	_ibuffer.str(getPropertyAsString(name, _obuffer.str()));
-	_ibuffer >> retval;
-	if (_ibuffer.fail() || _ibuffer.bad())
+    try {
+        return castUnsafe<float>(getPropertyAsString(name, ""));
+    } catch(std::runtime_error&) {
         return defaultValue;
-    else
-        return retval;
+    }
 }
 
-float SystemConfigurationImpl::getPropertyAsDouble(const string &name, const double defaultValue)
+double Configuration::getPropertyAsDouble(const std::string &name, const double defaultValue) const
 {
-	float retval;
-	_ibuffer.clear();
-	_obuffer.clear();
-	_obuffer.str("");
-	_obuffer << defaultValue;
-	_ibuffer.str(getPropertyAsString(name, _obuffer.str()));
-	_ibuffer >> retval;
-	if (_ibuffer.fail() || _ibuffer.bad())
+    try {
+        return castUnsafe<double>(getPropertyAsString(name, ""));
+    } catch(std::runtime_error&) {
         return defaultValue;
-    else
-        return retval;
+    }
 }
 
-string SystemConfigurationImpl::getPropertyAsString(const string &name, const string &defaultValue)
+std::string Configuration::getPropertyAsString(const std::string &name, const std::string &defaultValue) const
 {
-    const char* val = getenv(name.c_str());
-	if(val != NULL)
-	{
-		return _properties->getProperty(name, string(val));
-	}
-	return _properties->getProperty(name, defaultValue);
+    std::string val;
+    if(tryGetPropertyAsString(name, &val))
+        return val;
+    else
+        return defaultValue;
 }
 
-bool SystemConfigurationImpl::getPropertyAsAddress(const std::string& name, osiSockAddr* addr)
+bool Configuration::getPropertyAsAddress(const std::string& name, osiSockAddr* addr) const
 {
     unsigned short dftport=0;
     if(addr->sa.sa_family==AF_INET)
@@ -349,47 +91,153 @@ bool SystemConfigurationImpl::getPropertyAsAddress(const std::string& name, osiS
 
     if(val.empty()) return false;
 
+    memset(addr, 0, sizeof(*addr));
     addr->ia.sin_family = AF_INET;
     if(aToIPAddr(val.c_str(), dftport, &addr->ia))
         return false;
     return true;
 }
 
-bool SystemConfigurationImpl::hasProperty(const string &key)
+bool Configuration::hasProperty(const std::string &name) const
 {
-    const char* val = getenv(key.c_str());
-    return (val != NULL) || _properties->hasProperty(key);
+    return tryGetPropertyAsString(name, NULL);
 }
 
-ConfigurationProviderImpl::ConfigurationProviderImpl()
+bool ConfigurationMap::tryGetPropertyAsString(const std::string& name, std::string* val) const
 {
-
+    properties_t::const_iterator it = properties.find(name);
+    if(it==properties.end())
+        return false;
+    if(val)
+        *val = it->second;
+    return true;
 }
 
-ConfigurationProviderImpl::~ConfigurationProviderImpl()
+void ConfigurationMap::addKeys(keys_t& names) const
 {
+    for(properties_t::const_iterator it=properties.begin(); it!=properties.end(); ++it)
+        names.insert(it->first);
+}
+
+static
+const ENV_PARAM * findEnvConfigParam( const char * envVarName )
+{
+    const ENV_PARAM **ppParam = env_param_list;
+
+    /* Find a match with one of the EPICS env vars */
+    while (*ppParam) {
+        if ( strcmp( envVarName, (*ppParam)->name ) == 0 ) {
+            return *ppParam;
+        }
+    ppParam++;
+    }
+
+    return 0;
+}
+
+
+bool ConfigurationEnviron::tryGetPropertyAsString(const std::string& name, std::string* val) const
+{
+    const char *env = getenv(name.c_str());
+    if(!env) {
+        const ENV_PARAM *pParam = findEnvConfigParam( name.c_str() );
+        if ( pParam )
+            env = pParam->pdflt;
+    }
+    if(!env || !*env)
+        return false;
+    if(val)
+        *val = env;
+    return true;
+}
+
+bool ConfigurationStack::tryGetPropertyAsString(const std::string& name, std::string* val) const
+{
+    for(confs_t::const_reverse_iterator it = confs.rbegin(), end = confs.rend();
+            it!=end; ++it)
+    {
+        Configuration& conf = **it;
+        if(conf.tryGetPropertyAsString(name, val))
+            return true;
+    }
+    return false;
+}
+
+void ConfigurationStack::addKeys(keys_t& names) const
+{
+    for(confs_t::const_iterator it=confs.begin(); it!=confs.end(); ++it)
+        (*it)->addKeys(names);
+}
+
+ConfigurationBuilder::ConfigurationBuilder() :stack(new ConfigurationStack) {}
+
+ConfigurationBuilder& ConfigurationBuilder::push_env()
+{
+    Configuration::shared_pointer env(new ConfigurationEnviron);
+    stack->push_back(env);
+    return *this;
+}
+
+ConfigurationBuilder& ConfigurationBuilder::push_map()
+{
+    Configuration::shared_pointer env(new ConfigurationMap(mymap));
+    stack->push_back(env);
+    mymap.clear();
+    return *this;
+}
+
+ConfigurationBuilder&
+ConfigurationBuilder::push_config(const Configuration::shared_pointer& conf)
+{
+    stack->push_back(conf);
+    return *this;
+}
+
+ConfigurationBuilder&
+ConfigurationBuilder::_add(const std::string& name, const std::string& val)
+{
+    if(name.find_first_of(" \t\r\n")!=name.npos)
+        THROW_EXCEPTION2(std::invalid_argument, "Key name may not contain whitespace");
+    mymap[name] = val;
+    return *this;
+}
+
+Configuration::shared_pointer ConfigurationBuilder::build()
+{
+    if(!mymap.empty())
+        THROW_EXCEPTION2(std::logic_error, "Missing call to .push_map()");
+    if(stack->size()==0) {
+        return Configuration::shared_pointer(new ConfigurationMap); // empty map
+    } else if(stack->size()==1) {
+        return stack->pop_back();
+    } else {
+        return stack;
+    }
 }
 
 void ConfigurationProviderImpl::registerConfiguration(const string &name, Configuration::shared_pointer const & configuration)
 {
-	Lock guard(_mutex);
-	std::map<std::string,Configuration::shared_pointer>::iterator configsIter = _configs.find(name);
-	if(configsIter != _configs.end())
-	{
-		string msg = "configuration with name " + name + " already registered";
-		THROW_BASE_EXCEPTION(msg.c_str());
-	}
-	_configs[name] = configuration;
+    Lock guard(_mutex);
+    std::map<std::string,Configuration::shared_pointer>::iterator configsIter = _configs.find(name);
+    if(configsIter != _configs.end())
+    {
+        string msg = "configuration with name " + name + " already registered";
+        THROW_BASE_EXCEPTION(msg);
+    }
+    _configs[name] = configuration;
 }
 
 Configuration::shared_pointer ConfigurationProviderImpl::getConfiguration(const string &name)
 {
-	std::map<std::string,Configuration::shared_pointer>::iterator configsIter = _configs.find(name);
-	if(configsIter != _configs.end())
-	{
-		return configsIter->second;
-	}
-	return Configuration::shared_pointer();
+    Lock guard(_mutex);
+    std::map<std::string,Configuration::shared_pointer>::iterator configsIter = _configs.find(name);
+    if(configsIter != _configs.end())
+    {
+        return configsIter->second;
+    }
+    Configuration::shared_pointer env(new ConfigurationEnviron); // default to environment only
+    _configs[name] = env; // ensure that a later attempt to define this config will fail
+    return env;
 }
 
 ConfigurationProvider::shared_pointer configurationProvider;
@@ -397,16 +245,16 @@ Mutex conf_factory_mutex;
 
 ConfigurationProvider::shared_pointer ConfigurationFactory::getProvider()
 {
-	Lock guard(conf_factory_mutex);
-	if(configurationProvider.get() == NULL)
-	{
-		configurationProvider.reset(new ConfigurationProviderImpl());
-		// default
-		Configuration::shared_pointer systemConfig(new SystemConfigurationImpl());
-		configurationProvider->registerConfiguration("system", systemConfig);
-	}
-	return configurationProvider;
+    Lock guard(conf_factory_mutex);
+    if(configurationProvider.get() == NULL)
+    {
+        configurationProvider.reset(new ConfigurationProviderImpl());
+        Configuration::shared_pointer systemConfig(new ConfigurationEnviron);
+        configurationProvider->registerConfiguration("system", systemConfig);
+    }
+    return configurationProvider;
 }
 
-}}
+}
+}
 

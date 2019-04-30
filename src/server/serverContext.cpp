@@ -6,10 +6,16 @@
 
 #include <epicsSignal.h>
 
+#include <pv/lock.h>
+#include <pv/timer.h>
+#include <pv/thread.h>
+#include <pv/reftrack.h>
+
 #define epicsExportSharedSymbols
 #include <pv/responseHandlers.h>
 #include <pv/logger.h>
-#include <pv/serverContext.h>
+#include <pv/serverContextImpl.h>
+#include <pv/codec.h>
 #include <pv/security.h>
 
 using namespace std;
@@ -17,33 +23,32 @@ using namespace epics::pvData;
 using std::tr1::dynamic_pointer_cast;
 using std::tr1::static_pointer_cast;
 
-namespace epics { namespace pvAccess {
+namespace epics {
+namespace pvAccess {
 
-const char* ServerContextImpl::StateNames[] = { "NOT_INITIALIZED", "INITIALIZED", "RUNNING", "SHUTDOWN", "DESTROYED"};
-const Version ServerContextImpl::VERSION("pvAccess Server", "cpp", 
-    EPICS_PVA_MAJOR_VERSION, EPICS_PVA_MINOR_VERSION, EPICS_PVA_MAINTENANCE_VERSION, EPICS_PVA_DEVELOPMENT_FLAG);
+const Version ServerContextImpl::VERSION("pvAccess Server", "cpp",
+        EPICS_PVA_MAJOR_VERSION, EPICS_PVA_MINOR_VERSION, EPICS_PVA_MAINTENANCE_VERSION, EPICS_PVA_DEVELOPMENT_FLAG);
+
+size_t ServerContextImpl::num_instances;
 
 ServerContextImpl::ServerContextImpl():
-				_state(NOT_INITIALIZED),
-				_beaconAddressList(),
-				_ignoreAddressList(),
-				_autoBeaconAddressList(true),
-				_beaconPeriod(15.0),
-				_broadcastPort(PVA_BROADCAST_PORT),
-				_serverPort(PVA_SERVER_PORT),
-				_receiveBufferSize(MAX_TCP_RECV),
-				_timer(),
-				_broadcastTransport(),
-				_beaconEmitter(),
-				_acceptor(),
-				_transportRegistry(),
-				_channelProviderRegistry(),
-				_channelProviderNames(PVACCESS_DEFAULT_PROVIDER),
-				_channelProviders(),
-                _beaconServerStatusProvider(),
-                _startTime()
-
+    _beaconAddressList(),
+    _ignoreAddressList(),
+    _autoBeaconAddressList(true),
+    _beaconPeriod(15.0),
+    _broadcastPort(PVA_BROADCAST_PORT),
+    _serverPort(PVA_SERVER_PORT),
+    _receiveBufferSize(MAX_TCP_RECV),
+    _timer(new Timer("PVAS timers", lowerPriority)),
+    _beaconEmitter(),
+    _acceptor(),
+    _transportRegistry(),
+    _channelProviders(),
+    _beaconServerStatusProvider(),
+    _startTime()
 {
+    REFTRACE_INCREMENT(num_instances);
+
     epicsTimeGetCurrent(&_startTime);
 
     // TODO maybe there is a better place for this (when there will be some factory)
@@ -51,22 +56,22 @@ ServerContextImpl::ServerContextImpl():
     epicsSignalInstallSigPipeIgnore ();
 
     generateGUID();
-	initializeLogger();
-	loadConfiguration();
-}
-
-ServerContextImpl::shared_pointer ServerContextImpl::create()
-{
-    ServerContextImpl::shared_pointer thisPointer(new ServerContextImpl());
-    return thisPointer;
 }
 
 ServerContextImpl::~ServerContextImpl()
 {
-    dispose();
+    try
+    {
+        shutdown();
+    }
+    catch(std::exception& e)
+    {
+        std::cerr<<"Error in: ServerContextImpl::~ServerContextImpl: "<<e.what()<<"\n";
+    }
+    REFTRACE_DECREMENT(num_instances);
 }
 
-const GUID& ServerContextImpl::getGUID()
+const ServerGUID& ServerContextImpl::getGUID()
 {
     return _guid;
 }
@@ -76,50 +81,30 @@ const Version& ServerContextImpl::getVersion()
     return ServerContextImpl::VERSION;
 }
 
-/*
-#ifdef WIN32
-  UUID uuid;
-  UuidCreate ( &uuid );
-#else
-  uuid_t uuid;
-  uuid_generate_random ( uuid );
-#endif
-*/
-
 void ServerContextImpl::generateGUID()
 {
     // TODO use UUID
     epics::pvData::TimeStamp startupTime;
- 	startupTime.getCurrent();
+    startupTime.getCurrent();
 
- 	ByteBuffer buffer(_guid.value, sizeof(_guid.value));
- 	buffer.putLong(startupTime.getSecondsPastEpoch());
+    ByteBuffer buffer(_guid.value, sizeof(_guid.value));
+    buffer.putLong(startupTime.getSecondsPastEpoch());
     buffer.putInt(startupTime.getNanoseconds());
 }
 
-void ServerContextImpl::initializeLogger()
+Configuration::const_shared_pointer ServerContextImpl::getConfiguration()
 {
-    //createFileLogger("serverContextImpl.log");
-}
-
-struct noop_deleter
-{
-    template<class T> void operator()(T * p) {}
-};
-
-Configuration::shared_pointer ServerContextImpl::getConfiguration()
-{
-	Lock guard(_mutex);
-	if (configuration.get() == 0)
-	{
-		ConfigurationProvider::shared_pointer configurationProvider = ConfigurationFactory::getProvider();
-		configuration = configurationProvider->getConfiguration("pvAccess-server");
-		if (configuration.get() == 0)
-		{
-			configuration = configurationProvider->getConfiguration("system");
-		}
-	}
-	return configuration;
+    Lock guard(_mutex);
+    if (configuration.get() == 0)
+    {
+        ConfigurationProvider::shared_pointer configurationProvider = ConfigurationFactory::getProvider();
+        configuration = configurationProvider->getConfiguration("pvAccess-server");
+        if (configuration.get() == 0)
+        {
+            configuration = configurationProvider->getConfiguration("system");
+        }
+    }
+    return configuration;
 }
 
 /**
@@ -127,12 +112,19 @@ Configuration::shared_pointer ServerContextImpl::getConfiguration()
  */
 void ServerContextImpl::loadConfiguration()
 {
-	Configuration::shared_pointer config = getConfiguration();
+    Configuration::const_shared_pointer config = configuration;
 
     // TODO for now just a simple switch
     int32 debugLevel = config->getPropertyAsInteger(PVACCESS_DEBUG, 0);
     if (debugLevel > 0)
         SET_LOG_LEVEL(logLevelDebug);
+
+    // TODO multiple addresses
+    memset(&_ifaceAddr, 0, sizeof(_ifaceAddr));
+    _ifaceAddr.ia.sin_family = AF_INET;
+    _ifaceAddr.ia.sin_addr.s_addr = htonl(INADDR_ANY);
+    _ifaceAddr.ia.sin_port = 0;
+    config->getPropertyAsAddress("EPICS_PVAS_INTF_ADDR_LIST", &_ifaceAddr);
 
     _beaconAddressList = config->getPropertyAsString("EPICS_PVA_ADDR_LIST", _beaconAddressList);
     _beaconAddressList = config->getPropertyAsString("EPICS_PVAS_BEACON_ADDR_LIST", _beaconAddressList);
@@ -145,6 +137,7 @@ void ServerContextImpl::loadConfiguration()
 
     _serverPort = config->getPropertyAsInteger("EPICS_PVA_SERVER_PORT", _serverPort);
     _serverPort = config->getPropertyAsInteger("EPICS_PVAS_SERVER_PORT", _serverPort);
+    _ifaceAddr.ia.sin_port = htons(_serverPort);
 
     _broadcastPort = config->getPropertyAsInteger("EPICS_PVA_BROADCAST_PORT", _broadcastPort);
     _broadcastPort = config->getPropertyAsInteger("EPICS_PVAS_BROADCAST_PORT", _broadcastPort);
@@ -152,534 +145,382 @@ void ServerContextImpl::loadConfiguration()
     _receiveBufferSize = config->getPropertyAsInteger("EPICS_PVA_MAX_ARRAY_BYTES", _receiveBufferSize);
     _receiveBufferSize = config->getPropertyAsInteger("EPICS_PVAS_MAX_ARRAY_BYTES", _receiveBufferSize);
 
-    _channelProviderNames = config->getPropertyAsString("EPICS_PVA_PROVIDER_NAMES", _channelProviderNames);
-    _channelProviderNames = config->getPropertyAsString("EPICS_PVAS_PROVIDER_NAMES", _channelProviderNames);
+    if(_channelProviders.empty()) {
+        std::string providers = config->getPropertyAsString("EPICS_PVAS_PROVIDER_NAMES", PVACCESS_DEFAULT_PROVIDER);
+
+        ChannelProviderRegistry::shared_pointer reg(ChannelProviderRegistry::servers());
+
+        if (providers == PVACCESS_ALL_PROVIDERS)
+        {
+            providers.resize(0); // VxWorks 5.5 omits clear()
+
+            std::set<std::string> names;
+            reg->getProviderNames(names);
+            for (std::set<std::string>::const_iterator iter = names.begin(); iter != names.end(); iter++)
+            {
+                ChannelProvider::shared_pointer channelProvider = reg->getProvider(*iter);
+                if (channelProvider) {
+                    _channelProviders.push_back(channelProvider);
+                } else {
+                    LOG(logLevelDebug, "Provider '%s' all, but missing\n", iter->c_str());
+                }
+            }
+
+        } else {
+            // split space separated names
+            std::stringstream ss(providers);
+            std::string providerName;
+            while (std::getline(ss, providerName, ' '))
+            {
+                ChannelProvider::shared_pointer channelProvider(reg->getProvider(providerName));
+                if (channelProvider) {
+                    _channelProviders.push_back(channelProvider);
+                } else {
+                    LOG(logLevelWarn, "Requested provider '%s' not found", providerName.c_str());
+                }
+            }
+        }
+    }
+
+    if(_channelProviders.empty())
+        LOG(logLevelError, "ServerContext configured with no Providers will do nothing!\n");
+
+    //
+    // introspect network interfaces
+    //
+
+    osiSockAttach();
+
+    SOCKET sock = epicsSocketCreate(AF_INET, SOCK_STREAM, 0);
+    if (!sock) {
+        THROW_BASE_EXCEPTION("Failed to create a socket needed to introspect network interfaces.");
+    }
+
+    if (discoverInterfaces(_ifaceList, sock, &_ifaceAddr))
+    {
+        THROW_BASE_EXCEPTION("Failed to introspect network interfaces.");
+    }
+    else if (_ifaceList.size() == 0)
+    {
+        THROW_BASE_EXCEPTION("No (specified) network interface(s) available.");
+    }
+    epicsSocketDestroy(sock);
+}
+
+Configuration::shared_pointer
+ServerContextImpl::getCurrentConfig()
+{
+    ConfigurationBuilder B;
+
+    std::ostringstream providerName;
+    for(size_t i=0; i<_channelProviders.size(); i++) {
+        if(i>0)
+            providerName<<" ";
+        providerName<<_channelProviders[i]->getProviderName();
+    }
+
+#define SET(K, V) B.add(K, V);
+
+    {
+        char buf[50];
+        ipAddrToA(&_ifaceAddr.ia, buf, sizeof(buf));
+        buf[sizeof(buf)-1] = '\0';
+        SET("EPICS_PVAS_INTF_ADDR_LIST", buf);
+    }
+
+    SET("EPICS_PVAS_BEACON_ADDR_LIST", getBeaconAddressList());
+    SET("EPICS_PVA_ADDR_LIST", getBeaconAddressList());
+
+    SET("EPICS_PVAS_AUTO_BEACON_ADDR_LIST",
+                         isAutoBeaconAddressList() ? "YES" : "NO");
+    SET("EPICS_PVA_AUTO_ADDR_LIST",
+                         isAutoBeaconAddressList() ? "YES" : "NO");
+
+    SET("EPICS_PVAS_BEACON_PERIOD", getBeaconPeriod());
+    SET("EPICS_PVA_BEACON_PERIOD", getBeaconPeriod());
+
+    SET("EPICS_PVAS_SERVER_PORT", getServerPort());
+    SET("EPICS_PVA_SERVER_PORT", getServerPort());
+
+    SET("EPICS_PVAS_BROADCAST_PORT", getBroadcastPort());
+    SET("EPICS_PVA_BROADCAST_PORT", getBroadcastPort());
+
+    SET("EPICS_PVAS_MAX_ARRAY_BYTES", getReceiveBufferSize());
+    SET("EPICS_PVA_MAX_ARRAY_BYTES", getReceiveBufferSize());
+
+    SET("EPICS_PVAS_PROVIDER_NAMES", providerName.str());
+
+#undef SET
+
+    return B.push_map().build();
 }
 
 bool ServerContextImpl::isChannelProviderNamePreconfigured()
 {
-    Configuration::shared_pointer config = getConfiguration();
-    return config->hasProperty("EPICS_PVA_PROVIDER_NAMES") || config->hasProperty("EPICS_PVAS_PROVIDER_NAMES");
+    Configuration::const_shared_pointer config = getConfiguration();
+    return config->hasProperty("EPICS_PVAS_PROVIDER_NAMES");
 }
 
-void ServerContextImpl::initialize(ChannelProviderRegistry::shared_pointer const & channelProviderRegistry)
+void ServerContextImpl::initialize()
 {
-	Lock guard(_mutex);
-    if (!channelProviderRegistry.get())
-	{
-		THROW_BASE_EXCEPTION("non null channelProviderRegistry expected");
-	}
+    Lock guard(_mutex);
 
-	if (_state == DESTROYED)
-	{
-		THROW_BASE_EXCEPTION("Context destroyed.");
-	}
-	else if (_state != NOT_INITIALIZED)
-	{
-		THROW_BASE_EXCEPTION("Context already initialized.");
-	}
+    // already called in loadConfiguration
+    //osiSockAttach();
 
-	_channelProviderRegistry = channelProviderRegistry;
+    ServerContextImpl::shared_pointer thisServerContext = shared_from_this();
+    // we create reference cycles here which are broken by our shutdown() method,
+    _responseHandler.reset(new ServerResponseHandler(thisServerContext));
 
+    _acceptor.reset(new BlockingTCPAcceptor(thisServerContext, _responseHandler, _ifaceAddr, _receiveBufferSize));
+    _serverPort = ntohs(_acceptor->getBindAddress()->ia.sin_port);
 
-    // user all providers
-    if (_channelProviderNames == PVACCESS_ALL_PROVIDERS)
+    // setup broadcast UDP transport
+    initializeUDPTransports(true, _udpTransports, _ifaceList, _responseHandler, _broadcastTransport,
+                            _broadcastPort, _autoBeaconAddressList, _beaconAddressList, _ignoreAddressList);
+
+    _beaconEmitter.reset(new BeaconEmitter("tcp", _broadcastTransport, thisServerContext));
+
+    _beaconEmitter->start();
+}
+
+void ServerContextImpl::run(uint32 seconds)
+{
+    //TODO review this
+    if(seconds == 0)
     {
-        _channelProviderNames.resize(0); // VxWorks 5.5 omits clear()
-
-        std::auto_ptr<ChannelProviderRegistry::stringVector_t> names = _channelProviderRegistry->getProviderNames();
-        for (ChannelProviderRegistry::stringVector_t::iterator iter = names->begin(); iter != names->end(); iter++)
-        {
-            ChannelProvider::shared_pointer channelProvider = _channelProviderRegistry->getProvider(*iter);
-            if (channelProvider)
-            {
-                _channelProviders.push_back(channelProvider);
-
-                // compile a list
-                if (!_channelProviderNames.empty())
-                    _channelProviderNames += ' ';
-                _channelProviderNames += *iter;
-            }
-        }
+        _runEvent.wait();
     }
     else
     {
-        // split space separated names
-        std::stringstream ss(_channelProviderNames);
-        std::string providerName;
-        while (std::getline(ss, providerName, ' '))
-        {
-            ChannelProvider::shared_pointer channelProvider = _channelProviderRegistry->getProvider(providerName);
-            if (channelProvider)
-                _channelProviders.push_back(channelProvider);
-        }
-    }    
-
-	//_channelProvider = _channelProviderRegistry->getProvider(_channelProviderNames);
-	if (_channelProviders.size() == 0)
-	{
-		std::string msg = "None of the specified channel providers are available: " + _channelProviderNames + ".";
-		THROW_BASE_EXCEPTION(msg.c_str());
-	}
-
-	internalInitialize();
-
-	_state = INITIALIZED;
+        _runEvent.wait(seconds);
+    }
 }
 
-std::auto_ptr<ResponseHandler> ServerContextImpl::createResponseHandler()
-{
-    ServerContextImpl::shared_pointer thisContext = shared_from_this();
-    return std::auto_ptr<ResponseHandler>(new ServerResponseHandler(thisContext));    
-}
-
-void ServerContextImpl::internalInitialize()
-{
-    osiSockAttach();
-
-	_timer.reset(new Timer("pvAccess-server timer", lowerPriority));
-	_transportRegistry.reset(new TransportRegistry());
-
-    ServerContextImpl::shared_pointer thisServerContext = shared_from_this();
-
-	_acceptor.reset(new BlockingTCPAcceptor(thisServerContext, thisServerContext, _serverPort, _receiveBufferSize));
-	_serverPort = ntohs(_acceptor->getBindAddress()->ia.sin_port);
-
-    // setup broadcast UDP transport
-    initializeBroadcastTransport();
-
-    // TODO introduce a constant
-    _beaconEmitter.reset(new BeaconEmitter("tcp", _broadcastTransport, thisServerContext));
-}
-
-void ServerContextImpl::initializeBroadcastTransport()
-{
-	// setup UDP transport
-	try
-	{
-		// where to bind (listen) address
-	    osiSockAddr listenLocalAddress;
-	    listenLocalAddress.ia.sin_family = AF_INET;
-	    listenLocalAddress.ia.sin_port = htons(_broadcastPort);
-	    listenLocalAddress.ia.sin_addr.s_addr = htonl(INADDR_ANY);
-
-		// where to send addresses
-	    SOCKET socket = epicsSocketCreate(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	    if (socket == INVALID_SOCKET)
-	    {
-	    	THROW_BASE_EXCEPTION("Failed to initialize broadcast UDP transport");
-	    }
-	    auto_ptr<InetAddrVector> broadcastAddresses(getBroadcastAddresses(socket,_broadcastPort));
-	    epicsSocketDestroy(socket);
-
-        TransportClient::shared_pointer nullTransportClient;
-
-        auto_ptr<BlockingUDPConnector> broadcastConnector(new BlockingUDPConnector(true, true, true));
-	    auto_ptr<epics::pvAccess::ResponseHandler> responseHandler = createResponseHandler();
-        _broadcastTransport = static_pointer_cast<BlockingUDPTransport>(broadcastConnector->connect(
-                nullTransportClient, responseHandler,
-                listenLocalAddress, PVA_PROTOCOL_REVISION,
-                PVA_DEFAULT_PRIORITY));
-        _broadcastTransport->setSendAddresses(broadcastAddresses.get());
-
-		// set ignore address list
-		if (!_ignoreAddressList.empty())
-		{
-			// we do not care about the port
-			auto_ptr<InetAddrVector> list(getSocketAddressList(_ignoreAddressList, 0, NULL));
-			if (list.get() != NULL && list->size() > 0)
-			{
-				_broadcastTransport->setIgnoredAddresses(list.get());
-			}
-		}
-		// set broadcast address list
-		if (!_beaconAddressList.empty())
-		{
-			// if auto is true, add it to specified list
-			InetAddrVector* appendList = NULL;
-			if (_autoBeaconAddressList == true)
-			{
-				appendList = _broadcastTransport->getSendAddresses();
-			}
-
-			auto_ptr<InetAddrVector> list(getSocketAddressList(_beaconAddressList, _broadcastPort, appendList));
-			if (list.get() != NULL  && list->size() > 0)
-			{
-                _broadcastTransport->setSendAddresses(list.get());
-			}
-		}
-
-
-        // setup local broadcasting
-        // TODO configurable local NIF, address
-        osiSockAddr loAddr;
-        getLoopbackNIF(loAddr, "", 0);
-        if (true)
-        {
-            try
-            {
-                osiSockAddr group;
-                aToIPAddr("224.0.0.128", _broadcastPort, &group.ia);
-                _broadcastTransport->join(group, loAddr);
-
-                osiSockAddr anyAddress;
-                anyAddress.ia.sin_family = AF_INET;
-                anyAddress.ia.sin_port = htons(0);
-                anyAddress.ia.sin_addr.s_addr = htonl(INADDR_ANY);
-
-                // NOTE: localMulticastTransport is not started (no read is called on a socket)
-                auto_ptr<epics::pvAccess::ResponseHandler> responseHandler2 = createResponseHandler();
-                _localMulticastTransport = static_pointer_cast<BlockingUDPTransport>(broadcastConnector->connect(
-                        nullTransportClient, responseHandler2,
-                        anyAddress, PVA_PROTOCOL_REVISION,
-                        PVA_DEFAULT_PRIORITY));
-                _localMulticastTransport->setMutlicastNIF(loAddr, true);
-                InetAddrVector sendAddressList;
-                sendAddressList.push_back(group);
-                _localMulticastTransport->setSendAddresses(&sendAddressList);
-
-                LOG(logLevelDebug, "Local multicast enabled on %s using network interface %s.",
-                    inetAddressToString(group).c_str(), inetAddressToString(loAddr, false).c_str());
-            }
-            catch (std::exception& ex)
-            {
-                LOG(logLevelDebug, "Failed to initialize local multicast, funcionality disabled. Reason: %s.", ex.what());
-            }
-        }
-        else
-        {
-            LOG(logLevelDebug, "Failed to detect a loopback network interface, local multicast disabled.");
-        }
-
-        _broadcastTransport->start();
-        if (_localMulticastTransport)
-            _localMulticastTransport->start();
-	}
-	catch (std::exception& e)
-	{
-		THROW_BASE_EXCEPTION_CAUSE("Failed to initialize broadcast UDP transport", e);
-	}
-	catch (...)
-	{
-		THROW_BASE_EXCEPTION("Failed to initialize broadcast UDP transport");
-	}
-}
-
-void ServerContextImpl::run(int32 seconds)
-{
-	if (seconds < 0)
-	{
-		THROW_BASE_EXCEPTION("seconds cannot be negative.");
-	}
-
-	{
-		Lock guard(_mutex);
-
-		if (_state == NOT_INITIALIZED)
-		{
-			THROW_BASE_EXCEPTION("Context not initialized.");
-		}
-		else if (_state == DESTROYED)
-		{
-			THROW_BASE_EXCEPTION("Context destroyed.");
-		}
-		else if (_state == RUNNING)
-		{
-			THROW_BASE_EXCEPTION("Context is already running.");
-		}
-		else if (_state == SHUTDOWN)
-		{
-			THROW_BASE_EXCEPTION("Context was shutdown.");
-		}
-
-		_state = RUNNING;
-	}
-
-	// run...
-	_beaconEmitter->start();
-
-	//TODO review this
-	if(seconds == 0)
-	{
-		_runEvent.wait();
-	}
-	else
-	{
-		_runEvent.wait(seconds);
-	}
-
-	{
-		Lock guard(_mutex);
-		_state = SHUTDOWN;
-	}
-}
+#define LEAK_CHECK(PTR, NAME) if((PTR) && !(PTR).unique()) { std::cerr<<"Leaking ServerContext " NAME " use_count="<<(PTR).use_count()<<"\n"<<show_referrers(PTR, false);}
 
 void ServerContextImpl::shutdown()
 {
-	Lock guard(_mutex);
-	if(_state == DESTROYED)
-	{
-		THROW_BASE_EXCEPTION("Context already destroyed.");
-	}
+    if(!_timer)
+        return; // already shutdown
 
-	// notify to stop running...
-	_runEvent.signal();
-}
+    // abort pending timers and prevent new timers from starting
+    _timer->close();
 
-void ServerContextImpl::destroy()
-{
-	Lock guard(_mutex);
-	if (_state == DESTROYED)
-	{
-		// silent return
-		return;
-		// exception is not OK, since we use
-		// shared_pointer-s auto-cleanup/destruction
-		// THROW_BASE_EXCEPTION("Context already destroyed.");
-	}
-
-	// shutdown if not already
-	shutdown();
-
-	// go into destroyed state ASAP
-	_state = DESTROYED;
-
-	internalDestroy();
-}
-
-
-void ServerContextImpl::internalDestroy()
-{
-	// stop responding to search requests
-    if (_broadcastTransport.get())
-	{
-		_broadcastTransport->close();
-		_broadcastTransport.reset();
-	}
-    // and close local multicast transport
-    if (_localMulticastTransport.get())
+    // stop responding to search requests
+    for (BlockingUDPTransportVector::const_iterator iter = _udpTransports.begin();
+            iter != _udpTransports.end(); iter++)
     {
-        _localMulticastTransport->close();
-        _localMulticastTransport.reset();
+        const BlockingUDPTransport::shared_pointer& transport = *iter;
+        // joins worker thread
+        transport->close();
+        // _udpTransports contains _broadcastTransport
+        // _broadcastTransport is referred to be _beaconEmitter
+        if(transport!=_broadcastTransport)
+            LEAK_CHECK(transport, "udp transport")
+    }
+    _udpTransports.clear();
+
+    // stop emitting beacons
+    if (_beaconEmitter)
+    {
+        _beaconEmitter->destroy();
+        LEAK_CHECK(_beaconEmitter, "_beaconEmitter")
+        _beaconEmitter.reset();
     }
 
-	// stop accepting connections
-    if (_acceptor.get())
-	{
-		_acceptor->destroy();
-		_acceptor.reset();
-	}
+    // close UDP sent transport
+    if (_broadcastTransport)
+    {
+        _broadcastTransport->close();
+        LEAK_CHECK(_broadcastTransport, "_broadcastTransport")
+        _broadcastTransport.reset();
+    }
 
-	// stop emitting beacons
-    if (_beaconEmitter.get())
-	{
-		_beaconEmitter->destroy();
-		_beaconEmitter.reset();
-	}
+    // stop accepting connections
+    if (_acceptor)
+    {
+        _acceptor->destroy();
+        LEAK_CHECK(_acceptor, "_acceptor")
+        _acceptor.reset();
+    }
 
-	// this will also destroy all channels
-	destroyAllTransports();
+    // this will also destroy all channels
+    _transportRegistry.clear();
+
+    // drop timer queue
+    LEAK_CHECK(_timer, "_timer")
+    _timer.reset();
+
+    // response handlers hold strong references to us,
+    // so must break the cycles
+    LEAK_CHECK(_responseHandler, "_responseHandler")
+    _responseHandler.reset();
+
+    _runEvent.signal();
 }
 
-void ServerContextImpl::destroyAllTransports()
+void ServerContext::printInfo(int lvl)
 {
-
-	// not initialized yet
-    if (!_transportRegistry.get())
-	{
-		return;
-	}
-
-	std::auto_ptr<TransportRegistry::transportVector_t> transports = _transportRegistry->toArray();
-	if (transports.get() == 0)
-	   return;
-	   
-    int size = (int)transports->size();
-	if (size == 0)
-		return;
-
-	LOG(logLevelInfo, "Server context still has %d transport(s) active and closing...", size);
-
-	for (int i = 0; i < size; i++)
-	{
-		Transport::shared_pointer transport = (*transports)[i];
-		try
-		{
-			transport->close();
-		}
-		catch (std::exception &e)
-		{
-			// do all exception safe, log in case of an error
-			LOG(logLevelError, "Unhandled exception caught from client code at %s:%d: %s", __FILE__, __LINE__, e.what());
-		}
-		catch (...)
-		{
-			// do all exception safe, log in case of an error
-			 LOG(logLevelError, "Unhandled exception caught from client code at %s:%d.", __FILE__, __LINE__);
-		}
-	}
-	
-	// now clear all (release)
-	_transportRegistry->clear();
-	
+    printInfo(cout, lvl);
 }
 
-void ServerContextImpl::printInfo()
+void ServerContextImpl::printInfo(ostream& str, int lvl)
 {
-	printInfo(cout);
-}
+    if(lvl==0) {
+        Lock guard(_mutex);
+        str << "VERSION : " << getVersion().getVersionString() << endl
+            << "PROVIDER_NAMES : ";
+        for(std::vector<ChannelProvider::shared_pointer>::const_iterator it = _channelProviders.begin();
+            it != _channelProviders.end(); ++it)
+        {
+            str<<(*it)->getProviderName()<<", ";
+        }
+        str << endl
+            << "BEACON_ADDR_LIST : " << _beaconAddressList << endl
+            << "AUTO_BEACON_ADDR_LIST : " << _autoBeaconAddressList << endl
+            << "BEACON_PERIOD : " << _beaconPeriod << endl
+            << "BROADCAST_PORT : " << _broadcastPort << endl
+            << "SERVER_PORT : " << _serverPort << endl
+            << "RCV_BUFFER_SIZE : " << _receiveBufferSize << endl
+            << "IGNORE_ADDR_LIST: " << _ignoreAddressList << endl
+            << "INTF_ADDR_LIST : " << inetAddressToString(_ifaceAddr, false) << endl;
 
-void ServerContextImpl::printInfo(ostream& str)
-{
-	Lock guard(_mutex);
-	str << "VERSION : " << getVersion().getVersionString() << endl \
-		<< "PROVIDER_NAMES : " << _channelProviderNames << endl \
-		<< "BEACON_ADDR_LIST : " << _beaconAddressList << endl \
-	    << "AUTO_BEACON_ADDR_LIST : " << _autoBeaconAddressList << endl \
-	    << "BEACON_PERIOD : " << _beaconPeriod << endl \
-	    << "BROADCAST_PORT : " << _broadcastPort << endl \
-	    << "SERVER_PORT : " << _serverPort << endl \
-	    << "RCV_BUFFER_SIZE : " << _receiveBufferSize << endl \
-	    << "IGNORE_ADDR_LIST: " << _ignoreAddressList << endl \
-	    << "STATE : " << ServerContextImpl::StateNames[_state] << endl;
-}
+    } else {
+        // lvl >= 1
 
-void ServerContextImpl::dispose()
-{
-	try
-	{
-		destroy();
-	}
-	catch(...)
-	{
-        std::cerr<<"Oh no, something when wrong in ServerContextImpl::dispose!\n";
-	}
+        TransportRegistry::transportVector_t transports;
+        _transportRegistry.toArray(transports);
+
+        str<<"Clients:\n";
+        for(TransportRegistry::transportVector_t::const_iterator it(transports.begin()), end(transports.end());
+            it!=end; ++it)
+        {
+            const Transport::shared_pointer& transport(*it);
+
+            str<<"client "<<transport->getType()<<"://"<<transport->getRemoteName()
+              <<" ver="<<unsigned(transport->getRevision())
+              <<" "<<(transport->isClosed()?"closed!":"");
+
+            const detail::BlockingServerTCPTransportCodec *casTransport = dynamic_cast<const detail::BlockingServerTCPTransportCodec*>(transport.get());
+
+            if(casTransport) {
+              str<<" "<<(casTransport ? casTransport->getChannelCount() : size_t(-1))<<" channels";
+            }
+
+            str<<"\n";
+
+            if(!casTransport || lvl<2)
+                return;
+            // lvl >= 2
+
+            typedef std::vector<ServerChannel::shared_pointer> channels_t;
+            channels_t channels;
+            casTransport->getChannels(channels);
+
+            for(channels_t::const_iterator it(channels.begin()), end(channels.end()); it!=end; ++it)
+            {
+                const ServerChannel *channel(static_cast<const ServerChannel*>(it->get()));
+                const Channel::shared_pointer& providerChan(channel->getChannel());
+                if(!providerChan)
+                    continue;
+
+                str<<"  "<<providerChan->getChannelName()
+                   <<(providerChan->isConnected()?"":" closed");
+                if(lvl>=3) {
+                    str<<"\t: ";
+                    providerChan->printInfo(str);
+                }
+                str<<"\n";
+            }
+        }
+    }
 }
 
 void ServerContextImpl::setBeaconServerStatusProvider(BeaconServerStatusProvider::shared_pointer const & beaconServerStatusProvider)
 {
-	_beaconServerStatusProvider = beaconServerStatusProvider;
-}
-
-bool ServerContextImpl::isInitialized()
-{
-	Lock guard(_mutex);
-	return _state == INITIALIZED || _state == RUNNING || _state == SHUTDOWN;
-}
-
-bool ServerContextImpl::isDestroyed()
-{
-	Lock guard(_mutex);
-	return _state == DESTROYED;
+    _beaconServerStatusProvider = beaconServerStatusProvider;
 }
 
 std::string ServerContextImpl::getBeaconAddressList()
 {
-	return _beaconAddressList;
+    return _beaconAddressList;
 }
 
 bool ServerContextImpl::isAutoBeaconAddressList()
 {
-	return _autoBeaconAddressList;
+    return _autoBeaconAddressList;
 }
 
 float ServerContextImpl::getBeaconPeriod()
 {
-	return _beaconPeriod;
+    return _beaconPeriod;
 }
 
 int32 ServerContextImpl::getReceiveBufferSize()
 {
-	return _receiveBufferSize;
+    return _receiveBufferSize;
 }
 
 int32 ServerContextImpl::getServerPort()
 {
-	return _serverPort;
-}
-
-void ServerContextImpl::setServerPort(int32 port)
-{
-	_serverPort = port;
+    return _serverPort;
 }
 
 int32 ServerContextImpl::getBroadcastPort()
 {
-	return _broadcastPort;
+    return _broadcastPort;
 }
 
 std::string ServerContextImpl::getIgnoreAddressList()
 {
-	return _ignoreAddressList;
+    return _ignoreAddressList;
 }
 
 BeaconServerStatusProvider::shared_pointer ServerContextImpl::getBeaconServerStatusProvider()
 {
-	return _beaconServerStatusProvider;
+    return _beaconServerStatusProvider;
 }
 
-osiSockAddr* ServerContextImpl::getServerInetAddress()
+const osiSockAddr* ServerContextImpl::getServerInetAddress()
 {
     if(_acceptor.get())
-	{
-		return const_cast<osiSockAddr*>(_acceptor->getBindAddress());
-	}
-	return NULL;
+    {
+        return const_cast<osiSockAddr*>(_acceptor->getBindAddress());
+    }
+    return NULL;
 }
 
-BlockingUDPTransport::shared_pointer ServerContextImpl::getBroadcastTransport()
+const BlockingUDPTransport::shared_pointer& ServerContextImpl::getBroadcastTransport()
 {
-	return _broadcastTransport;
+    return _broadcastTransport;
 }
 
-BlockingUDPTransport::shared_pointer ServerContextImpl::getLocalMulticastTransport()
+const std::vector<ChannelProvider::shared_pointer>& ServerContextImpl::getChannelProviders()
 {
-    return _localMulticastTransport;
-}
-
-ChannelProviderRegistry::shared_pointer ServerContextImpl::getChannelProviderRegistry()
-{
-	return _channelProviderRegistry;
-}
-
-std::string ServerContextImpl::getChannelProviderName()
-{
-	return _channelProviderNames;
-}
-
-// NOTE: not synced
-void ServerContextImpl::setChannelProviderName(std::string channelProviderName)
-{
-    if (_state != NOT_INITIALIZED)
-        throw std::logic_error("must be called before initialize");
-    _channelProviderNames = channelProviderName;
-}
-
-std::vector<ChannelProvider::shared_pointer>& ServerContextImpl::getChannelProviders()
-{
-	return _channelProviders;
+    return _channelProviders;
 }
 
 Timer::shared_pointer ServerContextImpl::getTimer()
 {
-	return _timer;
+    return _timer;
 }
 
-TransportRegistry::shared_pointer ServerContextImpl::getTransportRegistry()
+epics::pvAccess::TransportRegistry* ServerContextImpl::getTransportRegistry()
 {
-	return _transportRegistry;
+    return &_transportRegistry;
 }
 
 Channel::shared_pointer ServerContextImpl::getChannel(pvAccessID /*id*/)
 {
-	// not used
-	return Channel::shared_pointer();
+    // not used
+    return Channel::shared_pointer();
 }
 
 Transport::shared_pointer ServerContextImpl::getSearchTransport()
 {
-	// not used 
-	return Transport::shared_pointer();
+    // not used
+    return Transport::shared_pointer();
 }
 
 void ServerContextImpl::newServerDetected()
@@ -693,66 +534,74 @@ epicsTimeStamp& ServerContextImpl::getStartTime()
 }
 
 
-std::map<std::string, std::tr1::shared_ptr<SecurityPlugin> >& ServerContextImpl::getSecurityPlugins()
+const Context::securityPlugins_t& ServerContextImpl::getSecurityPlugins()
 {
     return SecurityPluginRegistry::instance().getServerSecurityPlugins();
 }
 
-
-
-struct ThreadRunnerParam {
-    ServerContextImpl::shared_pointer ctx;
-    int timeToRun;
-};
-
-static void threadRunner(void* usr)
-{
-    ThreadRunnerParam* pusr = static_cast<ThreadRunnerParam*>(usr);
-    ThreadRunnerParam param = *pusr;
-    delete pusr;
-
-    param.ctx->run(param.timeToRun);
-}
-
-
-
 ServerContext::shared_pointer startPVAServer(std::string const & providerNames, int timeToRun, bool runInSeparateThread, bool printInfo)
 {
-    ServerContextImpl::shared_pointer ctx = ServerContextImpl::create();
+    ServerContext::shared_pointer ret(ServerContext::create(ServerContext::Config()
+                                 .config(ConfigurationBuilder()
+                                         .add("EPICS_PVAS_PROVIDER_NAMES", providerNames)
+                                         .push_map()
+                                         .push_env() // environment takes precidence (top of stack)
+                                         .build())));
+    if(printInfo)
+        ret->printInfo();
 
-    // do not override configuration
-    if (!ctx->isChannelProviderNamePreconfigured())
-        ctx->setChannelProviderName(providerNames);
-    
-    ChannelProviderRegistry::shared_pointer channelProviderRegistry = getChannelProviderRegistry();
-    ctx->initialize(channelProviderRegistry);
-
-    if (printInfo)
-        ctx->printInfo();
-
-
-    if (runInSeparateThread)
-    {
-        // delete left to the thread
-        auto_ptr<ThreadRunnerParam> param(new ThreadRunnerParam());
-        param->ctx = ctx;
-        param->timeToRun = timeToRun;
-
-        // TODO can this fail?
-        epicsThreadCreate("startPVAServer",
-                          epicsThreadPriorityMedium,
-                          epicsThreadGetStackSize(epicsThreadStackBig),
-                          threadRunner, param.get());
-
-        param.release();
-    }
-    else
-    {
-        ctx->run(timeToRun);
+    if(!runInSeparateThread) {
+        ret->run(timeToRun);
+        ret->shutdown();
+    } else if(timeToRun!=0) {
+        LOG(logLevelWarn, "startPVAServer() timeToRun!=0 only supported when runInSeparateThread==false\n");
     }
 
-    return ctx;
+    return ret;
 }
 
+namespace {
+struct shutdown_dtor {
+    ServerContextImpl::shared_pointer wrapped;
+    shutdown_dtor(const ServerContextImpl::shared_pointer& wrapped) :wrapped(wrapped) {}
+    void operator()(ServerContext* self) {
+        wrapped->shutdown();
+        if(!wrapped.unique())
+            LOG(logLevelWarn, "ServerContextImpl::shutdown() doesn't break all internal ref. loops. use_count=%u\n", (unsigned)wrapped.use_count());
+        wrapped.reset();
+    }
+};
 }
+
+ServerContext::shared_pointer ServerContext::create(const Config &conf)
+{
+    ServerContextImpl::shared_pointer ret(new ServerContextImpl());
+    ret->configuration = conf._conf;
+    ret->_channelProviders = conf._providers;
+
+    if (!ret->configuration)
+    {
+        ConfigurationProvider::shared_pointer configurationProvider = ConfigurationFactory::getProvider();
+        ret->configuration = configurationProvider->getConfiguration("pvAccess-server");
+        if (!ret->configuration)
+        {
+            ret->configuration = configurationProvider->getConfiguration("system");
+        }
+    }
+    if(!ret->configuration) {
+        ret->configuration = ConfigurationBuilder().push_env().build();
+    }
+
+    ret->loadConfiguration();
+    ret->initialize();
+
+    // wrap the returned shared_ptr so that it's dtor calls ->shutdown() to break internal referance loops
+    {
+        ServerContextImpl::shared_pointer wrapper(ret.get(), shutdown_dtor(ret));
+        wrapper.swap(ret);
+    }
+
+    return ret;
 }
+
+}}

@@ -16,14 +16,15 @@
 using namespace epics::pvData;
 using namespace std;
 
-namespace epics { namespace pvAccess {
+namespace {
+using namespace epics::pvAccess;
 
 class ChannelPipelineMonitorImpl :
     public PipelineMonitor,
     public PipelineControl,
     public std::tr1::enable_shared_from_this<ChannelPipelineMonitorImpl>
 {
-    private:
+private:
 
     typedef vector<MonitorElement::shared_pointer> FreeElementQueue;
     typedef queue<MonitorElement::shared_pointer> MonitorElementQueue;
@@ -51,7 +52,7 @@ class ChannelPipelineMonitorImpl :
 
     bool m_unlistenReported;
 
-    public:
+public:
     ChannelPipelineMonitorImpl(
         Channel::shared_pointer const & channel,
         MonitorRequester::shared_pointer const & monitorRequester,
@@ -228,16 +229,6 @@ class ChannelPipelineMonitorImpl :
             m_pipelineSession->cancel();
     }
 
-    virtual void lock()
-    {
-        // noop
-    }
-
-    virtual void unlock()
-    {
-        // noop
-    }
-
     virtual size_t getFreeElementCount() {
         Lock guard(m_freeQueueLock);
         return m_freeQueue.size();
@@ -249,7 +240,7 @@ class ChannelPipelineMonitorImpl :
         return m_requestedCount;
     }
 
-    virtual epics::pvData::MonitorElement::shared_pointer getFreeElement() {
+    virtual MonitorElement::shared_pointer getFreeElement() {
         Lock guard(m_freeQueueLock);
         if (m_freeQueue.empty())
             return m_nullMonitorElement;
@@ -260,14 +251,14 @@ class ChannelPipelineMonitorImpl :
         return freeElement;
     }
 
-    virtual void putElement(epics::pvData::MonitorElement::shared_pointer const & element) {
+    virtual void putElement(MonitorElement::shared_pointer const & element) {
 
         bool notify = false;
         {
             Lock guard(m_monitorQueueLock);
             if (m_done)
                 return;
-                // throw std::logic_error("putElement called after done");
+            // throw std::logic_error("putElement called after done");
 
             m_monitorQueue.push(element);
             // TODO there is way to much of notification, per each putElement
@@ -307,27 +298,27 @@ private:
 
     static Status notSupportedStatus;
     static Status destroyedStatus;
-    
+
     AtomicBoolean m_destroyed;
-    
+
     ChannelProvider::shared_pointer m_provider;
     string m_channelName;
     ChannelRequester::shared_pointer m_channelRequester;
-    
+
     PipelineService::shared_pointer m_pipelineService;
 
-public:    
+public:
     POINTER_DEFINITIONS(PipelineChannel);
-    
+
     PipelineChannel(
-           ChannelProvider::shared_pointer const & provider,
-           string const & channelName,
-           ChannelRequester::shared_pointer const & channelRequester,
-           PipelineService::shared_pointer const & pipelineService) :
-           m_provider(provider),
-           m_channelName(channelName),
-           m_channelRequester(channelRequester),
-           m_pipelineService(pipelineService)
+        ChannelProvider::shared_pointer const & provider,
+        string const & channelName,
+        ChannelRequester::shared_pointer const & channelRequester,
+        PipelineService::shared_pointer const & pipelineService) :
+        m_provider(provider),
+        m_channelName(channelName),
+        m_channelRequester(channelRequester),
+        m_pipelineService(pipelineService)
     {
     }
 
@@ -340,7 +331,7 @@ public:
     {
         return m_provider;
     }
-    
+
     virtual std::string getRemoteAddress()
     {
         // local
@@ -349,9 +340,9 @@ public:
 
     virtual ConnectionState getConnectionState()
     {
-        return isConnected() ?
-                Channel::CONNECTED :
-                Channel::DESTROYED;
+        return m_destroyed.get() ?
+               Channel::DESTROYED :
+               Channel::CONNECTED;
     }
 
     virtual std::string getChannelName()
@@ -364,74 +355,14 @@ public:
         return m_channelRequester;
     }
 
-    virtual bool isConnected()
-    {
-        return !m_destroyed.get();
-    }
-
-
     virtual AccessRights getAccessRights(epics::pvData::PVField::shared_pointer const & /*pvField*/)
     {
         return none;
     }
 
-    virtual void getField(GetFieldRequester::shared_pointer const & requester,std::string const & /*subField*/)
-    {
-        requester->getDone(notSupportedStatus, epics::pvData::Field::shared_pointer());    
-    }
-
-    virtual ChannelProcess::shared_pointer createChannelProcess(
-            ChannelProcessRequester::shared_pointer const & channelProcessRequester,
-            epics::pvData::PVStructure::shared_pointer const & /*pvRequest*/)
-    {
-        ChannelProcess::shared_pointer nullPtr;
-        channelProcessRequester->channelProcessConnect(notSupportedStatus, nullPtr);
-        return nullPtr; 
-    }
-
-    virtual ChannelGet::shared_pointer createChannelGet(
-            ChannelGetRequester::shared_pointer const & channelGetRequester,
-            epics::pvData::PVStructure::shared_pointer const & /*pvRequest*/)
-    {
-        ChannelGet::shared_pointer nullPtr;
-        channelGetRequester->channelGetConnect(notSupportedStatus, nullPtr,
-            epics::pvData::Structure::const_shared_pointer());
-        return nullPtr; 
-    }
-            
-    virtual ChannelPut::shared_pointer createChannelPut(
-            ChannelPutRequester::shared_pointer const & channelPutRequester,
-            epics::pvData::PVStructure::shared_pointer const & /*pvRequest*/)
-    {
-        ChannelPut::shared_pointer nullPtr;
-        channelPutRequester->channelPutConnect(notSupportedStatus, nullPtr,
-            epics::pvData::Structure::const_shared_pointer());
-        return nullPtr; 
-    }
-            
-
-    virtual ChannelPutGet::shared_pointer createChannelPutGet(
-            ChannelPutGetRequester::shared_pointer const & channelPutGetRequester,
-            epics::pvData::PVStructure::shared_pointer const & /*pvRequest*/)
-    {
-        ChannelPutGet::shared_pointer nullPtr;
-        epics::pvData::Structure::const_shared_pointer nullStructure;
-        channelPutGetRequester->channelPutGetConnect(notSupportedStatus, nullPtr, nullStructure, nullStructure);
-        return nullPtr; 
-    }
-
-    virtual ChannelRPC::shared_pointer createChannelRPC(
-            ChannelRPCRequester::shared_pointer const & channelRPCRequester,
-            epics::pvData::PVStructure::shared_pointer const & /*pvRequest*/)
-    {
-        ChannelRPC::shared_pointer nullPtr;
-        channelRPCRequester->channelRPCConnect(notSupportedStatus, nullPtr);
-        return nullPtr;
-    }
-
-    virtual epics::pvData::Monitor::shared_pointer createMonitor(
-            epics::pvData::MonitorRequester::shared_pointer const & monitorRequester,
-            epics::pvData::PVStructure::shared_pointer const & pvRequest)
+    virtual Monitor::shared_pointer createMonitor(
+        MonitorRequester::shared_pointer const & monitorRequester,
+        epics::pvData::PVStructure::shared_pointer const & pvRequest)
     {
         if (!pvRequest)
             throw std::invalid_argument("pvRequest == null");
@@ -466,19 +397,14 @@ public:
     }
 
     virtual ChannelArray::shared_pointer createChannelArray(
-            ChannelArrayRequester::shared_pointer const & channelArrayRequester,
-            epics::pvData::PVStructure::shared_pointer const & /*pvRequest*/)
+        ChannelArrayRequester::shared_pointer const & channelArrayRequester,
+        epics::pvData::PVStructure::shared_pointer const & /*pvRequest*/)
     {
         ChannelArray::shared_pointer nullPtr;
         channelArrayRequester->channelArrayConnect(notSupportedStatus, nullPtr, epics::pvData::Array::const_shared_pointer());
-        return nullPtr; 
+        return nullPtr;
     }
-            
 
-    virtual void printInfo()
-    {
-        printInfo(std::cout);
-    }
 
     virtual void printInfo(std::ostream& out)
     {
@@ -493,50 +419,47 @@ public:
     {
         return getChannelName();
     }
-    
-    virtual void message(std::string const & message,MessageType messageType)
-    {
-        // just delegate
-        m_channelRequester->message(message, messageType);
-    }
 
     virtual void destroy()
     {
-        m_destroyed.set();   
-    } 
+        m_destroyed.set();
+    }
 };
 
 Status PipelineChannel::notSupportedStatus(Status::STATUSTYPE_ERROR, "only monitor (aka pipeline) requests are supported by this channel");
 Status PipelineChannel::destroyedStatus(Status::STATUSTYPE_ERROR, "channel destroyed");
 
+} // namespace
+namespace epics {
+namespace pvAccess {
+
 Channel::shared_pointer createPipelineChannel(ChannelProvider::shared_pointer const & provider,
-                                          std::string const & channelName,
-                                          ChannelRequester::shared_pointer const & channelRequester,
-                                          PipelineService::shared_pointer const & pipelineService)
+        std::string const & channelName,
+        ChannelRequester::shared_pointer const & channelRequester,
+        PipelineService::shared_pointer const & pipelineService)
 {
     // TODO use std::make_shared
     std::tr1::shared_ptr<PipelineChannel> tp(
-                new PipelineChannel(provider, channelName, channelRequester, pipelineService)
-                );
+        new PipelineChannel(provider, channelName, channelRequester, pipelineService)
+    );
     Channel::shared_pointer channel = tp;
     return channel;
 }
 
-
 class PipelineChannelProvider :
-    public virtual ChannelProvider, 
+    public virtual ChannelProvider,
     public virtual ChannelFind,
     public std::tr1::enable_shared_from_this<PipelineChannelProvider> {
 
 public:
     POINTER_DEFINITIONS(PipelineChannelProvider);
-    
-    static string PROVIDER_NAME;
 
-    static Status noSuchChannelStatus;
-    
+    static const string PROVIDER_NAME;
+
+    static const Status noSuchChannelStatus;
+
     // TODO thread pool support
-    
+
     PipelineChannelProvider() {
     }
 
@@ -548,19 +471,19 @@ public:
     {
         return shared_from_this();
     }
-    
+
     virtual void cancel() {}
 
     virtual void destroy() {}
 
     virtual ChannelFind::shared_pointer channelFind(std::string const & channelName,
-                        ChannelFindRequester::shared_pointer const & channelFindRequester)
+            ChannelFindRequester::shared_pointer const & channelFindRequester)
     {
         bool found;
         {
             Lock guard(m_mutex);
             found = (m_services.find(channelName) != m_services.end()) ||
-                     findWildService(channelName);
+                    findWildService(channelName);
         }
         ChannelFind::shared_pointer thisPtr(shared_from_this());
         channelFindRequester->channelFindResult(Status::Ok, thisPtr, found);
@@ -569,7 +492,7 @@ public:
 
 
     virtual ChannelFind::shared_pointer channelList(
-            ChannelListRequester::shared_pointer const & channelListRequester)
+        ChannelListRequester::shared_pointer const & channelListRequester)
     {
         if (!channelListRequester.get())
             throw std::runtime_error("null requester");
@@ -579,8 +502,8 @@ public:
             Lock guard(m_mutex);
             channelNames.reserve(m_services.size());
             for (PipelineServiceMap::const_iterator iter = m_services.begin();
-                 iter != m_services.end();
-                 iter++)
+                    iter != m_services.end();
+                    iter++)
                 channelNames.push_back(iter->first);
         }
 
@@ -590,9 +513,9 @@ public:
     }
 
     virtual Channel::shared_pointer createChannel(
-            std::string const & channelName,
-            ChannelRequester::shared_pointer const & channelRequester,
-            short /*priority*/)
+        std::string const & channelName,
+        ChannelRequester::shared_pointer const & channelRequester,
+        short /*priority*/)
     {
         PipelineService::shared_pointer service;
 
@@ -614,7 +537,7 @@ public:
             channelRequester->channelCreated(noSuchChannelStatus, nullChannel);
             return nullChannel;
         }
-               
+
         // TODO use std::make_shared
         std::tr1::shared_ptr<PipelineChannel> tp(
             new PipelineChannel(
@@ -654,8 +577,8 @@ public:
         if (isWildcardPattern(serviceName))
         {
             for (PipelineWildServiceList::iterator iter = m_wildServices.begin();
-                 iter != m_wildServices.end();
-                 iter++)
+                    iter != m_wildServices.end();
+                    iter++)
                 if (iter->first == serviceName)
                 {
                     m_wildServices.erase(iter);
@@ -664,14 +587,14 @@ public:
         }
     }
 
-private:    
+private:
     // assumes sync on services
     PipelineService::shared_pointer findWildService(string const & wildcard)
     {
         if (!m_wildServices.empty())
             for (PipelineWildServiceList::iterator iter = m_wildServices.begin();
-                 iter != m_wildServices.end();
-                 iter++)
+                    iter != m_wildServices.end();
+                    iter++)
                 if (Wildcard::wildcardfit(iter->first.c_str(), wildcard.c_str()))
                     return iter->second;
 
@@ -696,56 +619,14 @@ private:
     epics::pvData::Mutex m_mutex;
 };
 
-string PipelineChannelProvider::PROVIDER_NAME("PipelineService");
-Status PipelineChannelProvider::noSuchChannelStatus(Status::STATUSTYPE_ERROR, "no such channel");
-
-
-
-class PipelineChannelProviderFactory : public ChannelProviderFactory
-{
-public:
-    POINTER_DEFINITIONS(PipelineChannelProviderFactory);
-
-    PipelineChannelProviderFactory() :
-        m_channelProviderImpl(new PipelineChannelProvider())
-    {
-    }
-
-    virtual std::string getFactoryName()
-    {
-        return PipelineChannelProvider::PROVIDER_NAME;
-    }
-
-    virtual ChannelProvider::shared_pointer sharedInstance()
-    {
-        return m_channelProviderImpl;
-    }
-
-    virtual ChannelProvider::shared_pointer newInstance()
-    {
-        // TODO use std::make_shared
-        std::tr1::shared_ptr<PipelineChannelProvider> tp(new PipelineChannelProvider());
-        ChannelProvider::shared_pointer channelProvider = tp;
-        return channelProvider;
-    }
-
-private:
-    PipelineChannelProvider::shared_pointer m_channelProviderImpl;
-};
-
+const string PipelineChannelProvider::PROVIDER_NAME("PipelineService");
+const Status PipelineChannelProvider::noSuchChannelStatus(Status::STATUSTYPE_ERROR, "no such channel");
 
 PipelineServer::PipelineServer()
+    :m_channelProviderImpl(new PipelineChannelProvider)
 {
-    // TODO factory is never deregistered, multiple PipelineServer instances create multiple factories, etc.
-    m_channelProviderFactory.reset(new PipelineChannelProviderFactory());
-    registerChannelProviderFactory(m_channelProviderFactory);
-
-    m_channelProviderImpl = m_channelProviderFactory->sharedInstance();
-
-    m_serverContext = ServerContextImpl::create();
-    m_serverContext->setChannelProviderName(m_channelProviderImpl->getProviderName());
- 
-    m_serverContext->initialize(getChannelProviderRegistry());
+    m_serverContext = ServerContext::create(ServerContext::Config()
+                                            .provider(m_channelProviderImpl));
 }
 
 PipelineServer::~PipelineServer()
@@ -765,50 +646,28 @@ void PipelineServer::run(int seconds)
     m_serverContext->run(seconds);
 }
 
-struct ThreadRunnerParam {
-    PipelineServer::shared_pointer server;
-    int timeToRun;
-};
-
-static void threadRunner(void* usr)
-{
-    ThreadRunnerParam* pusr = static_cast<ThreadRunnerParam*>(usr);
-    ThreadRunnerParam param = *pusr;
-    delete pusr;
-
-    param.server->run(param.timeToRun);
-}
-
 /// Method requires usage of std::tr1::shared_ptr<PipelineServer>. This instance must be
 /// owned by a shared_ptr instance.
 void PipelineServer::runInNewThread(int seconds)
 {
-    std::auto_ptr<ThreadRunnerParam> param(new ThreadRunnerParam());
-    param->server = shared_from_this();
-    param->timeToRun = seconds;
-
-    epicsThreadCreate("PipelineServer thread",
-                      epicsThreadPriorityMedium,
-                      epicsThreadGetStackSize(epicsThreadStackSmall),
-                      threadRunner, param.get());
-
-    // let the thread delete 'param'
-    param.release();
+    if(seconds!=0)
+        std::cerr<<"PipelineServer::runInNewThread() only suppose seconds=0\n";
 }
 
 void PipelineServer::destroy()
 {
-    m_serverContext->destroy();
+    m_serverContext->shutdown();
 }
 
 void PipelineServer::registerService(std::string const & serviceName, PipelineService::shared_pointer const & service)
 {
-    std::tr1::dynamic_pointer_cast<PipelineChannelProvider>(m_channelProviderImpl)->registerService(serviceName, service);
+    m_channelProviderImpl->registerService(serviceName, service);
 }
 
 void PipelineServer::unregisterService(std::string const & serviceName)
 {
-    std::tr1::dynamic_pointer_cast<PipelineChannelProvider>(m_channelProviderImpl)->unregisterService(serviceName);
+    m_channelProviderImpl->unregisterService(serviceName);
 }
 
-}}
+}
+}

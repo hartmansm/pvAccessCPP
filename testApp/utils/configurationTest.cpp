@@ -14,23 +14,14 @@
 #include <epicsAssert.h>
 #include <epicsExit.h>
 #include <envDefs.h>
+#include <epicsString.h>
 #include <osiSock.h>
 
 #include <epicsUnitTest.h>
 #include <testMain.h>
 
-#ifdef _WIN32
-void setenv(char * a, char * b, int c)
-{
-    char buf[1024]; 
-    sprintf(buf, "%s=%s", a, b); 
-    _putenv(buf);
-}
-#endif
-
 using namespace epics::pvAccess;
 using namespace epics::pvData;
-using namespace std;
 
 static void showEnv(const char *name)
 {
@@ -41,6 +32,25 @@ static void setEnv(const char *name, const char *val)
 {
     epicsEnvSet(name, val);
     testDiag("%s = \"%s\"", name, getenv(name));
+}
+
+static void testBuilder()
+{
+    Configuration::shared_pointer C(ConfigurationBuilder()
+                                    .add("TESTKEY","value1")
+                                    .push_map()
+                                    .push_env()
+                                    .add("OTHERKEY","value3")
+                                    .push_map()
+                                    .build());
+
+    testOk1(C->getPropertyAsString("key", "X")=="X");
+    testOk1(C->getPropertyAsString("TESTKEY", "X")=="value1");
+    testOk1(C->getPropertyAsString("OTHERKEY", "X")=="value3");
+    setEnv("TESTKEY", "value2");
+    setEnv("OTHERKEY","value2");
+    testOk1(C->getPropertyAsString("TESTKEY", "X")=="value2");
+    testOk1(C->getPropertyAsString("OTHERKEY", "X")=="value3");
 }
 
 static void showAddr(const osiSockAddr& addr)
@@ -60,9 +70,9 @@ static void showAddr(const osiSockAddr& addr)
     } while(0)
 
 
-MAIN(configurationTest)
+static
+void testConfig()
 {
-    testPlan(35);
     testDiag("Default configuration");
     Configuration::shared_pointer configuration(new SystemConfigurationImpl());
 
@@ -126,7 +136,13 @@ MAIN(configurationTest)
 
     Configuration::shared_pointer configurationOut(configProvider->getConfiguration("conf1"));
     testOk1(configurationOut.get() == configuration.get());
+}
 
+MAIN(configurationTest)
+{
+    testPlan(40);
+    testBuilder();
+    testConfig();
     return testDone();
 }
 

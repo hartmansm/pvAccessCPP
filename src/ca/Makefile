@@ -1,11 +1,22 @@
-# This is a Makefile fragment, see ../Makefile
+TOP = ../..
+include $(TOP)/configure/CONFIG
 
-SRC_DIRS += $(PVACCESS_SRC)/ca
+LIBRARY += pvAccessCA
+pvAccessCA_LIBS += pvAccess pvData ca Com
+
+SHRLIB_VERSION ?= $(EPICS_PVA_MAJOR_VERSION).$(EPICS_PVA_MINOR_VERSION).$(EPICS_PVA_MAINTENANCE_VERSION)
+
+# needed for Windows
+LIB_SYS_LIBS_WIN32 += ws2_32
 
 INC += pv/caProvider.h
-INC += pv/caChannel.h
-INC += pv/caStatus.h
 
-LIBSRCS += caProvider.cpp
-LIBSRCS += caChannel.cpp
-LIBSRCS += caStatus.cpp
+pvAccessCA_SRCS += channelConnectThread.cpp
+pvAccessCA_SRCS += monitorEventThread.cpp
+pvAccessCA_SRCS += getDoneThread.cpp
+pvAccessCA_SRCS += putDoneThread.cpp
+pvAccessCA_SRCS += caProvider.cpp
+pvAccessCA_SRCS += caChannel.cpp
+pvAccessCA_SRCS += dbdToPv.cpp
+
+include $(TOP)/configure/RULES

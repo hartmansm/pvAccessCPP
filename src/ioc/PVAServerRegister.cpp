@@ -25,94 +25,110 @@
 #include <epicsEvent.h>
 #include <epicsThread.h>
 #include <iocsh.h>
+#include <initHooks.h>
 #include <epicsExit.h>
-
-#include <epicsExport.h>
 
 #include <pv/pvAccess.h>
 #include <pv/serverContext.h>
+#include <pv/iocshelper.h>
 
-using std::cout;
-using std::endl;
-using namespace epics::pvData;
-using namespace epics::pvAccess;
+#include <epicsExport.h>
 
-class PVAServerCTX;
-typedef std::tr1::shared_ptr<PVAServerCTX> PVAServerCTXPtr;
+namespace pvd = epics::pvData;
+namespace pva = epics::pvAccess;
 
-class PVAServerCTX :
-    public std::tr1::enable_shared_from_this<PVAServerCTX>
-{
-public:
-    POINTER_DEFINITIONS(PVAServerCTX);
-    static PVAServerCTXPtr getPVAServerCTX();
-    void start();
-    void stop();
-    virtual ~PVAServerCTX() {}
-private:
-    PVAServerCTX() {}
-    shared_pointer getPtrSelf()
-    {
-        return shared_from_this();
-    }
-    ServerContext::shared_pointer ctx;
-};
+namespace {
 
-void PVAServerCTX::start()
-{
-   if(ctx.get()) {
-        cout<< "PVAServer already started" << endl;
-        return;
-   }
-   ctx = startPVAServer(PVACCESS_ALL_PROVIDERS,0,true,true);
+pvd::Mutex the_server_lock;
+pva::ServerContext::shared_pointer the_server;
+
+void startitup() {
+    the_server = pva::ServerContext::create(pva::ServerContext::Config()
+                                            .config(pva::ConfigurationBuilder()
+                                                    // default to all providers instead of just "local"
+                                                    .add("EPICS_PVAS_PROVIDER_NAMES", pva::PVACCESS_ALL_PROVIDERS)
+                                                    .push_map()
+                                                    // prefer to use EPICS_PVAS_PROVIDER_NAMES
+                                                    // from environment
+                                                    .push_env()
+                                                    .build()));
 }
 
-void PVAServerCTX::stop()
+void startPVAServer(const char *names)
 {
-   if(!ctx.get()) {
-        cout<< "PVAServer already stopped" << endl;
-        return;
-   }
-   ctx->destroy();
-   ctx.reset();
-   epicsThreadSleep(1.0);
-}
-
-PVAServerCTXPtr PVAServerCTX::getPVAServerCTX()
-{
-    static PVAServerCTXPtr pvPVAServerCTX;
-    static Mutex mutex;
-    Lock xx(mutex);
-
-   if(!pvPVAServerCTX.get()) {
-      pvPVAServerCTX = PVAServerCTXPtr(new PVAServerCTX());
-   }
-   return pvPVAServerCTX;
-}
-
-static void pvaServerExitHandler(void* /*pPrivate*/) {
-cout << "pvaServerExitHandler\n";
-    PVAServerCTX::getPVAServerCTX()->stop();
-}
-
-static const iocshFuncDef startPVAServerFuncDef = {
-    "startPVAServer", 0, 0
-};
-extern "C" void startPVAServer(const iocshArgBuf *args)
-{
-    PVAServerCTX::getPVAServerCTX()->start();
-    epicsAtExit(pvaServerExitHandler, NULL);
-}
-
-
-static void registerStartPVAServer(void)
-{
-    static int firstTime = 1;
-    if (firstTime) {
-        firstTime = 0;
-        iocshRegister(&startPVAServerFuncDef, startPVAServer);
+    try {
+        if(names && names[0]!='\0') {
+            printf("Warning: startPVAServer() no longer accepts provider list as argument.\n"
+                       "         Instead place the following before calling startPVAServer() and iocInit()\n"
+                       "  epicsEnvSet(\"EPICS_PVAS_PROVIDER_NAMES\", \"%s\")\n",
+                    names);
+        }
+        pvd::Lock G(the_server_lock);
+        if(the_server) {
+            std::cout<<"PVA server already running\n";
+            return;
+        }
+        startitup();
+    }catch(std::exception& e){
+        std::cout<<"Error: "<<e.what()<<"\n";
     }
 }
+
+void stopPVAServer()
+{
+    try {
+        pvd::Lock G(the_server_lock);
+        if(!the_server) {
+            std::cout<<"PVA server not running\n";
+            return;
+        }
+        the_server.reset();
+    }catch(std::exception& e){
+        std::cout<<"Error: "<<e.what()<<"\n";
+    }
+}
+
+void pvasr(int lvl)
+{
+    try {
+        pvd::Lock G(the_server_lock);
+        if(!the_server) {
+            std::cout<<"PVA server not running\n";
+            return;
+        } else {
+            the_server->printInfo(lvl);
+        }
+    }catch(std::exception& e){
+        std::cout<<"Error: "<<e.what()<<"\n";
+    }
+}
+
+void pva_server_cleanup(void *)
+{
+    stopPVAServer();
+}
+
+void initStartPVAServer(initHookState state)
+{
+    pvd::Lock G(the_server_lock);
+    if(state==initHookAfterIocRunning && !the_server) {
+        epicsAtExit(&pva_server_cleanup, 0);
+        startitup();
+
+    } else if(state==initHookAtIocPause) {
+        the_server.reset();
+    }
+}
+
+void registerStartPVAServer(void)
+{
+    epics::iocshRegister<const char*, &startPVAServer>("startPVAServer", "provider names");
+    epics::iocshRegister<&stopPVAServer>("stopPVAServer");
+    epics::iocshRegister<int, &pvasr>("pvasr", "detail");
+    initHookRegister(&initStartPVAServer);
+}
+
+} // namespace
 
 extern "C" {
     epicsExportRegistrar(registerStartPVAServer);
